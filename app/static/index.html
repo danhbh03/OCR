@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OCR tiếng Việt local</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #182230; background: #f4f6f8; }
+    body { margin: 0; }
+    header { padding: 20px max(24px, calc((100% - 1200px) / 2)); background: #173b57; color: white; }
+    header h1 { margin: 0; font-size: 1.35rem; }
+    main { max-width: 1200px; margin: 24px auto; padding: 0 20px; }
+    .upload, .panel { background: white; border: 1px solid #dce2e8; border-radius: 10px; padding: 18px; }
+    .upload { display: flex; flex-wrap: wrap; align-items: end; gap: 14px; }
+    label { display: grid; gap: 6px; font-weight: 600; }
+    input, select, textarea, button { font: inherit; }
+    input[type=file], select { padding: 8px; border: 1px solid #b8c2cc; border-radius: 6px; }
+    button { border: 0; border-radius: 6px; padding: 10px 16px; background: #176b9b; color: white; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 18px; }
+    .panel h2 { margin: 0 0 12px; font-size: 1.05rem; }
+    .image-frame { position: relative; display: flex; min-height: 120px; justify-content: center; align-items: center; overflow: auto; background: #eef1f4; }
+    #source-image { display: block; max-width: 100%; max-height: 70vh; object-fit: contain; }
+    #image-overlay { position: absolute; pointer-events: none; }
+    .selection-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+    #region-button.active { background: #a84d00; }
+    #adjust-detection-button.active { background: #a84d00; }
+    textarea { width: 100%; min-height: 250px; box-sizing: border-box; border: 1px solid #b8c2cc; border-radius: 6px; padding: 10px; line-height: 1.6; }
+    #machine-text { min-height: 130px; background: #f7f8fa; }
+    #edited-text { min-height: 360px; }
+    .actions { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
+    #message { min-height: 1.5em; margin: 12px 0; }
+    #history { display: flex; flex-wrap: wrap; gap: 8px; }
+    #history button { background: #e6eef3; color: #173b57; }
+    .muted { color: #607080; font-size: .9rem; }
+    @media (max-width: 720px) { .workspace { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header><h1>OCR tiếng Việt — chạy trên máy của bạn</h1></header>
+  <main>
+    <form class="upload" id="upload-form">
+      <label>Ảnh tài liệu<input name="file" type="file" accept="image/*" required></label>
+      <label>Bộ nhận dạng
+        <select name="engine">
+          <option value="vietocr">VietOCR — khuyến nghị cho chữ in tiếng Việt</option>
+          <option value="paddle">PaddleOCR — baseline đa ngôn ngữ Latin</option>
+        </select>
+      </label>
+      <button id="upload-button" type="submit">Tải ảnh và nhận dạng</button>
+      <span class="muted">PNG, JPEG, WEBP, BMP, TIFF · tối đa 15 MB</span>
+    </form>
+    <p id="message" role="status"></p>
+    <section class="workspace" aria-label="Kết quả nhận dạng">
+      <div class="panel">
+        <h2>Ảnh gốc</h2>
+        <div class="image-frame">
+          <img id="source-image" alt="Ảnh tài liệu gốc">
+          <canvas id="image-overlay" aria-hidden="true"></canvas>
+        </div>
+        <p id="highlight-hint" class="muted">Chọn dòng trong phần văn bản đã sửa để tô sáng vùng tương ứng trên ảnh.</p>
+        <div class="selection-tools">
+          <button id="region-button" type="button" disabled>Chọn vùng bị bỏ sót</button>
+          <button id="adjust-detection-button" type="button" disabled>Điều chỉnh vùng dòng đang chọn</button>
+          <span id="region-hint" class="muted">Có thể kéo chọn phần chữ chưa được OCR nhận ra.</span>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Máy nhận dạng</h2>
+        <textarea id="machine-text" readonly placeholder="Kết quả OCR sẽ hiển thị ở đây"></textarea>
+        <h2 style="margin-top:16px">Bản chỉnh sửa của người dùng</h2>
+        <textarea id="edited-text" placeholder="Sửa nội dung để khớp với tài liệu"></textarea>
+        <div class="actions">
+          <span id="status" class="muted"></span>
+          <button id="save-button" type="button" disabled>Lưu bản chỉnh sửa</button>
+        </div>
+      </div>
+    </section>
+    <section class="panel" style="margin-top:18px">
+      <h2>Tài liệu gần đây</h2>
+      <div id="history" class="muted">Chưa có tài liệu.</div>
+    </section>
+  </main>
+  <script>
+    let currentDocument = null;
+    const form = document.querySelector("#upload-form");
+    const message = document.querySelector("#message");
+    const uploadButton = document.querySelector("#upload-button");
+    const saveButton = document.querySelector("#save-button");
+    const sourceImage = document.querySelector("#source-image");
+    const overlay = document.querySelector("#image-overlay");
+    const overlayContext = overlay.getContext("2d");
+    const editedText = document.querySelector("#edited-text");
+    const highlightHint = document.querySelector("#highlight-hint");
+    const regionButton = document.querySelector("#region-button");
+    const adjustDetectionButton = document.querySelector("#adjust-detection-button");
+    const regionHint = document.querySelector("#region-hint");
+    let regionSelectionMode = false;
+    let detectionAdjustmentMode = false;
+    let selectedDetectionIndex = null;
+    let selectedEditedLineIndex = null;
+    let regionDragStart = null;
+    let regionDragEnd = null;
+
+    function showDocument(record) {
+      currentDocument = record;
+      sourceImage.onload = drawHighlights;
+      sourceImage.src = `${record.image_url}?t=${Date.now()}`;
+      document.querySelector("#machine-text").value = record.original_text;
+      editedText.value = record.edited_text;
+      document.querySelector("#status").textContent =
+        `${record.engine} · ${record.status === "reviewed" ? "đã chỉnh sửa" : "chưa duyệt"}`;
+      saveButton.disabled = false;
+      regionButton.disabled = false;
+      adjustDetectionButton.disabled = false;
+      regionSelectionMode = false;
+      detectionAdjustmentMode = false;
+      selectedDetectionIndex = null;
+      selectedEditedLineIndex = null;
+      regionDragStart = null;
+      regionDragEnd = null;
+      regionButton.classList.remove("active");
+      adjustDetectionButton.classList.remove("active");
+      overlay.style.pointerEvents = "none";
+      overlay.style.cursor = "default";
+      regionHint.textContent = "Có thể kéo chọn phần chữ chưa được OCR nhận ra.";
+      drawHighlights();
+    }
+
+    function selectedEditedLineIndexes() {
+      const text = editedText.value;
+      const start = editedText.selectionStart;
+      const end = editedText.selectionEnd;
+      const firstOffset = start === end ? start : Math.min(start, end);
+      const lastOffset = start === end ? end : Math.max(start, end) - 1;
+      const firstLine = text.slice(0, firstOffset).split("\n").length - 1;
+      const lastLine = text.slice(0, lastOffset).split("\n").length - 1;
+      return { firstLine, lastLine };
+    }
+
+    function mapEditedLinesToOcr(selected) {
+      if (!currentDocument) return [];
+      const originalLines = currentDocument.original_text.split("\n");
+      const editedLines = editedText.value.split("\n");
+      const matcher = new Intl.Collator("vi", { sensitivity: "base" });
+      const normalized = (value) => value.normalize("NFC").trim();
+      const left = originalLines.map(normalized);
+      const right = editedLines.map(normalized);
+      const rows = Array.from({ length: left.length + 1 }, () =>
+        new Uint32Array(right.length + 1)
+      );
+
+      for (let i = left.length - 1; i >= 0; i--) {
+        for (let j = right.length - 1; j >= 0; j--) {
+          rows[i][j] = matcher.compare(left[i], right[j]) === 0
+            ? rows[i + 1][j + 1] + 1
+            : Math.max(rows[i + 1][j], rows[i][j + 1]);
+        }
+      }
+
+      const matches = [];
+      let i = 0;
+      let j = 0;
+      while (i < left.length && j < right.length) {
+        if (matcher.compare(left[i], right[j]) === 0) {
+          matches.push([i++, j++]);
+        } else if (rows[i + 1][j] >= rows[i][j + 1]) {
+          i++;
+        } else {
+          j++;
+        }
+      }
+
+      const result = new Set();
+      for (let editedIndex = selected.firstLine; editedIndex <= selected.lastLine; editedIndex++) {
+        const exact = matches.find(([, currentIndex]) => currentIndex === editedIndex);
+        if (exact) {
+          result.add(exact[0]);
+          continue;
+        }
+
+        const previous = [...matches].reverse().find(([, currentIndex]) => currentIndex < editedIndex);
+        const next = matches.find(([, currentIndex]) => currentIndex > editedIndex);
+        let originalIndex;
+        if (previous && next) {
+          const originalStart = previous[0] + 1;
+          const originalEnd = next[0] - 1;
+          originalIndex = originalStart <= originalEnd
+            ? Math.min(originalStart + editedIndex - previous[1] - 1, originalEnd)
+            : previous[0];
+        } else if (next) {
+          originalIndex = Math.max(0, next[0] - (next[1] - editedIndex));
+        } else if (previous) {
+          originalIndex = Math.min(
+            originalLines.length - 1,
+            previous[0] + editedIndex - previous[1]
+          );
+        } else {
+          originalIndex = Math.min(editedIndex, originalLines.length - 1);
+        }
+        if (originalIndex >= 0) result.add(originalIndex);
+      }
+      return [...result];
+    }
+
+    function drawHighlights() {
+      if (!currentDocument || !sourceImage.complete || !sourceImage.naturalWidth) return;
+      const ratio = window.devicePixelRatio || 1;
+      const width = sourceImage.clientWidth;
+      const height = sourceImage.clientHeight;
+      overlay.style.left = `${sourceImage.offsetLeft}px`;
+      overlay.style.top = `${sourceImage.offsetTop}px`;
+      overlay.style.width = `${width}px`;
+      overlay.style.height = `${height}px`;
+      overlay.width = Math.round(width * ratio);
+      overlay.height = Math.round(height * ratio);
+      overlayContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+      overlayContext.clearRect(0, 0, width, height);
+
+      const selected = selectedEditedLineIndexes();
+      const ocrIndexes = mapEditedLinesToOcr(selected);
+      const scaleX = width / sourceImage.naturalWidth;
+      const scaleY = height / sourceImage.naturalHeight;
+      for (const index of ocrIndexes) {
+        const detection = currentDocument.detections[index];
+        if (!detection || !detection.box?.length) continue;
+        const points = detection.box.map(([x, y]) => [x * scaleX, y * scaleY]);
+        overlayContext.beginPath();
+        overlayContext.moveTo(points[0][0], points[0][1]);
+        for (const [x, y] of points.slice(1)) overlayContext.lineTo(x, y);
+        overlayContext.closePath();
+        overlayContext.fillStyle = "rgba(255, 190, 35, 0.28)";
+        overlayContext.strokeStyle = "#e08a00";
+        overlayContext.lineWidth = 2;
+        overlayContext.fill();
+        overlayContext.stroke();
+      }
+
+      if (regionSelectionMode && regionDragStart && regionDragEnd) {
+        const x = Math.min(regionDragStart.x, regionDragEnd.x) * scaleX;
+        const y = Math.min(regionDragStart.y, regionDragEnd.y) * scaleY;
+        const selectionWidth = Math.abs(regionDragEnd.x - regionDragStart.x) * scaleX;
+        const selectionHeight = Math.abs(regionDragEnd.y - regionDragStart.y) * scaleY;
+        overlayContext.fillStyle = "rgba(23, 107, 155, 0.2)";
+        overlayContext.strokeStyle = "#176b9b";
+        overlayContext.lineWidth = 2;
+        overlayContext.fillRect(x, y, selectionWidth, selectionHeight);
+        overlayContext.strokeRect(x, y, selectionWidth, selectionHeight);
+      }
+
+      highlightHint.textContent = ocrIndexes.length
+        ? `Đang tô sáng ${ocrIndexes.length} vùng ảnh tương ứng với dòng đang chọn.`
+        : "Không tìm thấy vùng OCR tương ứng cho dòng này.";
+    }
+
+    function pointerToImagePoint(event) {
+      const rect = overlay.getBoundingClientRect();
+      return {
+        x: Math.max(0, Math.min(sourceImage.naturalWidth,
+          (event.clientX - rect.left) * sourceImage.naturalWidth / rect.width)),
+        y: Math.max(0, Math.min(sourceImage.naturalHeight,
+          (event.clientY - rect.top) * sourceImage.naturalHeight / rect.height))
+      };
+    }
+
+    async function recognizeSelectedRegion(selection) {
+      if (!currentDocument) return;
+      regionButton.disabled = true;
+      regionHint.textContent = "Đang nhận dạng vùng đã chọn…";
+      message.textContent = "";
+      try {
+        const response = await fetch(`/api/documents/${currentDocument.id}/regions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...selection, edited_text: editedText.value })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Không nhận dạng được vùng chọn.");
+        showDocument(result);
+        message.textContent = `Đã chèn vùng chữ vào dòng ${result.inserted_at_line + 1}: ${result.added_text}`;
+        regionHint.textContent = "Đã chèn vùng nhận dạng theo vị trí trên ảnh. Bạn có thể sửa văn bản như bình thường.";
+      } catch (error) {
+        message.textContent = error.message;
+        regionHint.textContent = "Vùng chưa được thêm. Bạn có thể chọn lại vùng chữ khác hoặc điều chỉnh khung rộng hơn.";
+      } finally {
+        regionButton.disabled = !currentDocument;
+      }
+    }
+
+    function startRegionSelection(adjustDetection) {
+      if (!currentDocument) return;
+      if (adjustDetection) {
+        const selectedLines = selectedEditedLineIndexes();
+        const indexes = mapEditedLinesToOcr(selectedLines);
+        if (selectedLines.firstLine !== selectedLines.lastLine || indexes.length !== 1) {
+          regionHint.textContent = "Đặt con trỏ trong đúng một dòng trước khi điều chỉnh vùng.";
+          return;
+        }
+        selectedDetectionIndex = indexes[0];
+        selectedEditedLineIndex = selectedLines.firstLine;
+      } else {
+        selectedDetectionIndex = null;
+        selectedEditedLineIndex = null;
+      }
+      detectionAdjustmentMode = adjustDetection;
+      regionSelectionMode = true;
+      regionDragStart = null;
+      regionDragEnd = null;
+      regionButton.classList.toggle("active", !adjustDetection);
+      adjustDetectionButton.classList.toggle("active", adjustDetection);
+      overlay.style.pointerEvents = "auto";
+      overlay.style.cursor = "crosshair";
+      regionHint.textContent = adjustDetection
+        ? "Kéo vùng mới rộng hơn quanh cùng một dòng để OCR lại và lưu nhãn phát hiện."
+        : "Kéo chuột trên ảnh để chọn vùng chữ bị bỏ sót.";
+      drawHighlights();
+    }
+
+    async function adjustSelectedDetection(selection) {
+      if (!currentDocument || selectedDetectionIndex === null) return;
+      adjustDetectionButton.disabled = true;
+      regionHint.textContent = "Đang OCR lại dòng trong vùng mới…";
+      try {
+        const response = await fetch(`/api/documents/${currentDocument.id}/detections/adjust`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...selection,
+            detection_index: selectedDetectionIndex,
+            edited_line_index: selectedEditedLineIndex,
+            edited_text: editedText.value
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Không điều chỉnh được vùng OCR.");
+        showDocument(result);
+        message.textContent = `Đã OCR lại dòng: ${result.adjusted_text}`;
+        regionHint.textContent = result.detection_sample_created
+          ? "Đã lưu ảnh và vùng chữ đã xác nhận làm dữ liệu phát hiện PaddleOCR."
+          : "Vùng ảnh trùng đã có trong kho dữ liệu phát hiện; không tạo bản lặp.";
+      } catch (error) {
+        message.textContent = error.message;
+        regionHint.textContent = "Hãy chọn lại vùng bao quanh đúng một dòng.";
+      } finally {
+        adjustDetectionButton.disabled = !currentDocument;
+      }
+    }
+
+    async function loadHistory() {
+      const response = await fetch("/api/documents");
+      if (!response.ok) throw new Error("Không tải được danh sách tài liệu.");
+      const documents = await response.json();
+      const history = document.querySelector("#history");
+      history.replaceChildren();
+      if (!documents.length) {
+        history.textContent = "Chưa có tài liệu.";
+        return;
+      }
+      documents.forEach((item) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = `${new Date(item.created_at).toLocaleString("vi-VN")} · ${item.engine}`;
+        button.addEventListener("click", () => showDocument(item));
+        history.append(button);
+      });
+      if (!currentDocument) showDocument(documents[0]);
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      uploadButton.disabled = true;
+      message.textContent = "Đang nhận dạng…";
+      try {
+        const response = await fetch("/api/documents", { method: "POST", body: new FormData(form) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Nhận dạng thất bại.");
+        showDocument(result);
+        message.textContent = "Đã nhận dạng xong. Hãy kiểm tra và chỉnh sửa văn bản.";
+        await loadHistory();
+      } catch (error) {
+        message.textContent = error.message;
+      } finally {
+        uploadButton.disabled = false;
+      }
+    });
+
+    saveButton.addEventListener("click", async () => {
+      if (!currentDocument) return;
+      saveButton.disabled = true;
+      try {
+        const response = await fetch(`/api/documents/${currentDocument.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ edited_text: editedText.value })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Không lưu được bản sửa.");
+        message.textContent = result.message;
+        await loadHistory();
+        document.querySelector("#status").textContent = `${currentDocument.engine} · đã chỉnh sửa`;
+      } catch (error) {
+        message.textContent = error.message;
+      } finally {
+        saveButton.disabled = false;
+      }
+    });
+
+    for (const eventName of ["click", "keyup", "select", "input"]) {
+      editedText.addEventListener(eventName, drawHighlights);
+    }
+    regionButton.addEventListener("click", () => startRegionSelection(false));
+    adjustDetectionButton.addEventListener("click", () => startRegionSelection(true));
+    overlay.addEventListener("pointerdown", (event) => {
+      if (!regionSelectionMode) return;
+      event.preventDefault();
+      regionDragStart = pointerToImagePoint(event);
+      regionDragEnd = regionDragStart;
+      overlay.setPointerCapture(event.pointerId);
+      drawHighlights();
+    });
+    overlay.addEventListener("pointermove", (event) => {
+      if (!regionSelectionMode || !regionDragStart) return;
+      regionDragEnd = pointerToImagePoint(event);
+      drawHighlights();
+    });
+    overlay.addEventListener("pointerup", (event) => {
+      if (!regionSelectionMode || !regionDragStart) return;
+      regionDragEnd = pointerToImagePoint(event);
+      const left = Math.min(regionDragStart.x, regionDragEnd.x);
+      const top = Math.min(regionDragStart.y, regionDragEnd.y);
+      const selection = {
+        x: Math.floor(left),
+        y: Math.floor(top),
+        width: Math.ceil(Math.abs(regionDragEnd.x - regionDragStart.x)),
+        height: Math.ceil(Math.abs(regionDragEnd.y - regionDragStart.y))
+      };
+      regionDragStart = null;
+      regionDragEnd = null;
+      regionSelectionMode = false;
+      const adjustDetection = detectionAdjustmentMode;
+      detectionAdjustmentMode = false;
+      regionButton.classList.remove("active");
+      adjustDetectionButton.classList.remove("active");
+      overlay.style.pointerEvents = "none";
+      overlay.style.cursor = "default";
+      drawHighlights();
+      if (selection.width < 8 || selection.height < 8) {
+        regionHint.textContent = "Vùng chọn quá nhỏ; hãy kéo chọn vùng chữ lớn hơn.";
+        return;
+      }
+      if (adjustDetection) adjustSelectedDetection(selection);
+      else recognizeSelectedRegion(selection);
+    });
+    window.addEventListener("resize", drawHighlights);
+
+    loadHistory().catch((error) => { message.textContent = error.message; });
+  </script>
+</body>
+</html>
