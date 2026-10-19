@@ -21,31 +21,30 @@ def merge_pdf_text(
         if not normalized_detection:
             continue
         for pdf_index, pdf_line in enumerate(pdf_lines):
-            similarity = SequenceMatcher(
-                None,
-                normalized_detection,
-                pdf_line["normalized_text"],
-                autojunk=False,
-            ).ratio()
+            matched_text, similarity = _best_matching_segment(
+                normalized_detection, pdf_line["words"]
+            )
             if similarity >= 0.55:
-                candidate_matches.append((similarity, detection_index, pdf_index))
+                candidate_matches.append(
+                    (similarity, detection_index, pdf_index, matched_text)
+                )
 
     candidate_matches.sort(reverse=True)
     matched_detections: set[int] = set()
     matched_pdf_lines: set[int] = set()
     merged_detections = [dict(detection) for detection in detections]
-    for _, detection_index, pdf_index in candidate_matches:
+    for _, detection_index, pdf_index, matched_text in candidate_matches:
         if detection_index in matched_detections or pdf_index in matched_pdf_lines:
             continue
         matched_detections.add(detection_index)
         matched_pdf_lines.add(pdf_index)
-        merged_detections[detection_index]["text"] = pdf_lines[pdf_index]["text"]
+        merged_detections[detection_index]["text"] = matched_text
         merged_detections[detection_index]["text_source"] = "pdf"
 
     return _join_detection_text(merged_detections), merged_detections
 
 
-def _extract_pdf_lines(page: Any) -> list[dict[str, str]]:
+def _extract_pdf_lines(page: Any) -> list[dict[str, Any]]:
     grouped_words: dict[tuple[int, int], list[tuple[int, str]]] = {}
 
     for word in page.get_text("words", sort=False):
@@ -61,14 +60,45 @@ def _extract_pdf_lines(page: Any) -> list[dict[str, str]]:
     lines = []
     for words in grouped_words.values():
         words.sort(key=lambda word: word[0])
-        text = _join_pdf_words([word[1] for word in words])
         lines.append(
             {
-                "text": text,
-                "normalized_text": _normalize_for_comparison(text),
+                "words": [word[1] for word in words],
             }
         )
     return lines
+
+
+def _best_matching_segment(
+    normalized_detection: str,
+    pdf_words: list[str],
+) -> tuple[str, float]:
+    best_text = ""
+    best_similarity = 0.0
+    best_length_difference = float("inf")
+    for start in range(len(pdf_words)):
+        for end in range(start + 1, len(pdf_words) + 1):
+            candidate_text = _join_pdf_words(pdf_words[start:end])
+            normalized_candidate = _normalize_for_comparison(candidate_text)
+            similarity = SequenceMatcher(
+                None,
+                normalized_detection,
+                normalized_candidate,
+                autojunk=False,
+            ).ratio()
+            length_difference = abs(
+                len(normalized_detection) - len(normalized_candidate)
+            )
+            if (
+                similarity > best_similarity
+                or (
+                    similarity == best_similarity
+                    and length_difference < best_length_difference
+                )
+            ):
+                best_text = candidate_text
+                best_similarity = similarity
+                best_length_difference = length_difference
+    return best_text, best_similarity
 
 
 def _join_pdf_words(words: list[str]) -> str:
