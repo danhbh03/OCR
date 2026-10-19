@@ -46,10 +46,27 @@ def initialize_database() -> None:
                 status TEXT NOT NULL DEFAULT 'needs_review',
                 detections_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                pdf_id TEXT,
+                pdf_source_name TEXT,
+                pdf_page_number INTEGER,
+                pdf_page_count INTEGER
             )
             """
         )
+        document_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(documents)")
+        }
+        for column, column_type in (
+            ("pdf_id", "TEXT"),
+            ("pdf_source_name", "TEXT"),
+            ("pdf_page_number", "INTEGER"),
+            ("pdf_page_count", "INTEGER"),
+        ):
+            if column not in document_columns:
+                connection.execute(
+                    f"ALTER TABLE documents ADD COLUMN {column} {column_type}"
+                )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS training_samples (
@@ -246,25 +263,47 @@ def save_document(
     engine: str,
     detections: list[dict[str, Any]],
 ) -> None:
+    save_documents(
+        [
+            {
+                "id": document_id,
+                "image_name": image_name,
+                "original_text": original_text,
+                "engine": engine,
+                "detections": detections,
+            }
+        ]
+    )
+
+
+def save_documents(documents: list[dict[str, Any]]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with connect() as connection:
-        connection.execute(
+        connection.executemany(
             """
             INSERT INTO documents (
                 id, image_name, original_text, edited_text, engine,
-                detections_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                detections_json, created_at, updated_at, pdf_id,
+                pdf_source_name, pdf_page_number, pdf_page_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                document_id,
-                image_name,
-                original_text,
-                original_text,
-                engine,
-                json.dumps(detections, ensure_ascii=False),
-                now,
-                now,
-            ),
+            [
+                (
+                    document["id"],
+                    document["image_name"],
+                    document["original_text"],
+                    document["original_text"],
+                    document["engine"],
+                    json.dumps(document["detections"], ensure_ascii=False),
+                    now,
+                    now,
+                    document.get("pdf_id"),
+                    document.get("pdf_source_name"),
+                    document.get("pdf_page_number"),
+                    document.get("pdf_page_count"),
+                )
+                for document in documents
+            ],
         )
 
 
@@ -282,6 +321,20 @@ def list_documents() -> list[dict[str, Any]]:
             "SELECT * FROM documents ORDER BY created_at DESC"
         ).fetchall()
     return [_serialize(row) for row in rows]
+
+
+def list_pdf_pages(document_id: str) -> list[dict[str, Any]]:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT pdf_id FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        if row is None or row["pdf_id"] is None:
+            return []
+        rows = connection.execute(
+            "SELECT * FROM documents WHERE pdf_id = ? ORDER BY pdf_page_number",
+            (row["pdf_id"],),
+        ).fetchall()
+    return [_serialize(page) for page in rows]
 
 
 def update_document(document_id: str, edited_text: str) -> bool:

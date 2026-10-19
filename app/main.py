@@ -1,5 +1,6 @@
 import os
 import hashlib
+import math
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,9 +16,14 @@ from starlette.concurrency import run_in_threadpool
 from app import database
 from app.corrections import extract_corrected_samples
 from app.ocr import OCRUnavailableError, recognize
+from app.pdf_text import merge_pdf_text
 
 
 MAX_UPLOAD_BYTES = int(os.getenv("OCR_MAX_UPLOAD_BYTES", 15 * 1024 * 1024))
+MAX_PDF_PAGES = 25
+PDF_RENDER_DPI = 200
+MAX_PDF_RENDERED_PIXELS = 100_000_000
+MAX_PDF_RENDERED_BYTES = 100 * 1024 * 1024
 ALLOWED_FORMATS = {
     "JPEG": ".jpg",
     "PNG": ".png",
@@ -72,9 +78,13 @@ async def documents() -> list[dict]:
 
 @app.get("/api/training-samples")
 async def training_samples(engine: str | None = None) -> list[dict[str, Any]]:
-    if engine not in {None, "paddle", "vietocr"}:
+    if engine not in {None, "ppocrv6", "paddle", "tesseract", "vietocr"}:
         raise HTTPException(
-            status_code=422, detail="Engine phải là paddle hoặc vietocr."
+            status_code=422,
+            detail=(
+                "Engine phải là ppocrv6, tesseract hoặc paddle/vietocr "
+                "(tài liệu cũ)."
+            ),
         )
     samples = database.list_training_samples()
     return [sample for sample in samples if engine is None or sample["engine"] == engine]
@@ -137,10 +147,13 @@ async def detection_sample_image(sample_id: str) -> FileResponse:
 
 @app.post("/api/documents")
 async def create_document(
-    file: UploadFile = File(...), engine: str = Form("vietocr")
+    file: UploadFile = File(...), engine: str = Form("ppocrv6")
 ) -> dict:
-    if engine not in {"paddle", "vietocr"}:
-        raise HTTPException(status_code=422, detail="Engine phải là paddle hoặc vietocr.")
+    if engine not in {"ppocrv6", "paddle", "tesseract"}:
+        raise HTTPException(
+            status_code=422,
+            detail="Engine phải là ppocrv6 hoặc tesseract.",
+        )
 
     content = await file.read(MAX_UPLOAD_BYTES + 1)
     if not content:
@@ -148,7 +161,12 @@ async def create_document(
     if len(content) > MAX_UPLOAD_BYTES:
         limit_mb = MAX_UPLOAD_BYTES / (1024 * 1024)
         raise HTTPException(
-            status_code=413, detail=f"Ảnh vượt quá giới hạn {limit_mb:g} MB."
+            status_code=413, detail=f"Tệp vượt quá giới hạn {limit_mb:g} MB."
+        )
+
+    if (file.filename or "").lower().endswith(".pdf"):
+        return await _create_pdf_documents(
+            content, file.filename or "document.pdf", engine
         )
 
     try:
@@ -158,7 +176,9 @@ async def create_document(
             image_format = image.format
             image.verify()
     except (UnidentifiedImageError, OSError) as error:
-        raise HTTPException(status_code=415, detail="Tệp tải lên không phải ảnh hợp lệ.") from error
+        raise HTTPException(
+            status_code=415, detail="Tệp tải lên không phải ảnh hợp lệ."
+        ) from error
 
     extension = ALLOWED_FORMATS.get(image_format or "")
     if extension is None:
@@ -188,6 +208,131 @@ async def create_document(
     return result
 
 
+async def _create_pdf_documents(content: bytes, filename: str, engine: str) -> dict:
+    pdf_source_name = Path(filename.replace("\\", "/")).name
+    pdf_id = str(uuid.uuid4())
+    image_paths = []
+    try:
+        page_results = await run_in_threadpool(
+            _recognize_pdf_pages, content, engine
+        )
+        documents = []
+        for page_number, (image_bytes, text, detections) in enumerate(
+            page_results, start=1
+        ):
+            document_id = str(uuid.uuid4())
+            image_name = f"{document_id}.png"
+            image_path = database.UPLOAD_DIR / image_name
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_paths.append(image_path)
+            image_path.write_bytes(image_bytes)
+            documents.append(
+                {
+                    "id": document_id,
+                    "image_name": image_name,
+                    "original_text": text,
+                    "engine": engine,
+                    "detections": detections,
+                    "pdf_id": pdf_id,
+                    "pdf_source_name": pdf_source_name,
+                    "pdf_page_number": page_number,
+                    "pdf_page_count": len(page_results),
+                }
+            )
+        database.save_documents(documents)
+    except OCRUnavailableError as error:
+        for image_path in image_paths:
+            image_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except HTTPException:
+        for image_path in image_paths:
+            image_path.unlink(missing_ok=True)
+        raise
+    except Exception as error:
+        for image_path in image_paths:
+            image_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500, detail=f"Không nhận dạng được PDF: {error}"
+        ) from error
+
+    result = database.get_document(documents[0]["id"])
+    if result is None:
+        raise HTTPException(status_code=500, detail="Không đọc lại được kết quả PDF.")
+    return result
+
+
+def _recognize_pdf_pages(
+    content: bytes, engine: str
+) -> list[tuple[bytes, str, list[dict[str, Any]]]]:
+    try:
+        import pymupdf
+    except ImportError as error:
+        raise OCRUnavailableError(
+            "Chưa cài PyMuPDF để đọc PDF. Cài requirements.txt "
+            "hoặc requirements-gpu.txt rồi khởi động lại."
+        ) from error
+
+    try:
+        pdf = pymupdf.open(stream=content, filetype="pdf")
+    except (pymupdf.FileDataError, RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=415, detail="Tệp PDF không hợp lệ.") from error
+
+    with pdf:
+        if pdf.needs_pass:
+            raise HTTPException(
+                status_code=422, detail="PDF được bảo vệ bằng mật khẩu chưa hỗ trợ."
+            )
+        page_count = pdf.page_count
+        if page_count == 0:
+            raise HTTPException(status_code=422, detail="PDF không có trang nào.")
+        if page_count > MAX_PDF_PAGES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"PDF vượt quá giới hạn {MAX_PDF_PAGES} trang.",
+            )
+
+        results = []
+        rendered_pixels = 0
+        rendered_bytes = 0
+        for page_index in range(page_count):
+            page = pdf.load_page(page_index)
+            scale = PDF_RENDER_DPI / 72
+            width = math.ceil(page.rect.width * scale)
+            height = math.ceil(page.rect.height * scale)
+            page_pixels = width * height
+            if width > 8000 or height > 8000 or page_pixels > 40_000_000:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Trang {page_index + 1} có kích thước vượt giới hạn xử lý.",
+                )
+            rendered_pixels += page_pixels
+            if rendered_pixels > MAX_PDF_RENDERED_PIXELS:
+                raise HTTPException(
+                    status_code=413,
+                    detail="PDF vượt quá giới hạn tổng kích thước ảnh sau khi chuyển trang.",
+                )
+
+            pixmap = page.get_pixmap(dpi=PDF_RENDER_DPI, alpha=False)
+            image_bytes = pixmap.tobytes("png")
+            rendered_bytes += len(image_bytes)
+            if rendered_bytes > MAX_PDF_RENDERED_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="PDF vượt quá giới hạn dung lượng sau khi chuyển trang.",
+                )
+
+            temporary_path = database.DATA_DIR / f".pdf-page-{uuid.uuid4()}.png"
+            try:
+                temporary_path.write_bytes(image_bytes)
+                text, detections = recognize(str(temporary_path), engine)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            text, detections = merge_pdf_text(page, detections)
+            results.append((image_bytes, text, detections))
+
+    return results
+
+
 @app.get("/api/documents/{document_id}/image")
 async def document_image(document_id: str) -> FileResponse:
     document = database.get_document(document_id)
@@ -197,6 +342,14 @@ async def document_image(document_id: str) -> FileResponse:
     if not image_path.is_file():
         raise HTTPException(status_code=404, detail="Không tìm thấy ảnh gốc.")
     return FileResponse(image_path)
+
+
+@app.get("/api/documents/{document_id}/pages")
+async def pdf_document_pages(document_id: str) -> list[dict[str, Any]]:
+    pages = database.list_pdf_pages(document_id)
+    if not pages:
+        raise HTTPException(status_code=404, detail="Không tìm thấy các trang PDF.")
+    return pages
 
 
 @app.post("/api/documents/{document_id}/regions")

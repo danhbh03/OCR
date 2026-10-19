@@ -1,0 +1,22 @@
+# Local OCR documents, database, model weights, and training samples
+/data/
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Internal chatbot handoff; keep locally, not in the public repository
+/CHATBOT_HANDOFF.md
+
+# Windows/macOS metadata
+Thumbs.db
+.DS_Store

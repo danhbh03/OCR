@@ -1,14 +1,16 @@
---extra-index-url https://download.pytorch.org/whl/cu121
---find-links https://www.paddlepaddle.org.cn/whl/windows/mkl/avx/stable.html
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.29,<1.0
 python-multipart>=0.0.9
 pillow>=10.0
+PyMuPDF>=1.24,<2.0
 numpy>=1.26,<2.0
+pytesseract>=0.3.10,<1.0
+doclayout-yolo==0.0.4
+huggingface-hub>=0.25,<1.0
 setuptools<81
-# PaddleOCR and VietOCR CUDA engines for Windows, Python 3.10 x64
-paddlepaddle-gpu==2.6.1.post120
-paddleocr>=2.7,<3.0
-vietocr>=0.3.12
-torch==2.5.1+cu121
-torchvision==0.20.1+cu121
+# PaddleOCR 3.7.0 provides the PP-OCRv6 TextDetection API.
+# Tesseract performs all text recognition.
+# PaddlePaddle 3.2.0 Windows GPU wheel uses CUDA 11.8.
+paddlepaddle-gpu==3.2.0
+paddleocr==3.7.0

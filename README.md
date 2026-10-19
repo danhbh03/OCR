@@ -1,72 +1,76 @@
 # OCR tiếng Việt chạy local
 
-Ứng dụng dùng FastAPI, hiển thị ảnh gốc và kết quả OCR để người dùng chỉnh sửa, lưu mẫu đã xác nhận. Chạy trên Windows với **Python 3.10.x 64-bit**.
+Ứng dụng web chạy trên Windows để OCR ảnh/PDF tiếng Việt, đối chiếu kết quả với ảnh gốc, sửa thủ công và lưu mẫu đã xác nhận.
 
-## Cài GPU NVIDIA trên Windows
+## Cách hoạt động
 
-### Điều kiện
+- **PP-OCRv6 Medium** phát hiện dòng chữ; **DocLayout-YOLO** nhận diện bố cục và sắp xếp nội dung.
+- **Tesseract** là bộ duy nhất nhận dạng chữ. Có thể chọn Tesseract + DocLayout-YOLO để đối chiếu, không dùng PP-OCRv6.
+- PDF có lớp văn bản được dùng để thay nội dung OCR khi khớp; PDF scan được xử lý như ảnh.
+- Không có tự động sửa chính tả. Người dùng tự sửa nội dung trước khi lưu.
 
-- Máy có GPU NVIDIA và driver NVIDIA hỗ trợ CUDA 12; kiểm tra driver bằng `nvidia-smi` trong PowerShell.
-- Cài Miniconda/Anaconda. Dùng Python **3.10 x64** trong môi trường Conda bên dưới.
-- Không cần cài CUDA Toolkit toàn hệ thống. Môi trường Conda sẽ cài CUDA runtime và cuDNN mà PaddleOCR cần.
+## Yêu cầu
 
-### Tạo môi trường GPU
+- Windows 64-bit, Python 3.10 và Conda (Miniconda hoặc Anaconda).
+- Tesseract có dữ liệu ngôn ngữ tiếng Việt (`vie`).
+- Kết nối Internet lần đầu chạy để tải model OCR/bố cục.
+- GPU là tùy chọn; chế độ GPU cần NVIDIA GPU tương thích với PaddlePaddle CUDA 11.8.
 
-Mở **Miniconda Prompt** hoặc PowerShell đã dùng được lệnh `conda`, chuyển tới thư mục project, rồi chạy:
+## Cài đặt
 
-```powershell
-cd D:\MCP_AI\OCR
-conda create -n ocr-gpu python=3.10 pip -y
-conda activate ocr-gpu
-conda install -c conda-forge cuda-version=12.0 cudnn=8.9.1.23 -y
-python -m pip install -r requirements-gpu.txt
-```
+Mở Miniconda Prompt tại thư mục project và tạo **một** trong hai môi trường:
 
-Các lệnh tạo môi trường và cài thư viện chỉ cần chạy một lần. Nếu đã có môi trường `ocr-gpu`, bỏ qua lệnh `conda create` và kích hoạt môi trường đó bằng `conda activate ocr-gpu`.
-
-File GPU cài PaddlePaddle GPU `2.6.1.post120` (CUDA 12.0) và PyTorch `2.5.1+cu121` (CUDA 12.1). Đây là hai runtime đi kèm riêng theo từng framework; không đổi phiên bản tùy ý và không cài `requirements.txt` CPU vào môi trường GPU.
-
-### Kiểm tra GPU
-
-Khi vẫn đang kích hoạt `ocr-gpu`, chạy:
-
-```powershell
-python -c "import paddle; print('Paddle CUDA:', paddle.is_compiled_with_cuda()); paddle.set_device('gpu:0'); print('Paddle device:', paddle.to_tensor([1]).place)"
-python -c "import torch; print('PyTorch CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'không khả dụng')"
-```
-
-Kết quả mong đợi: Paddle CUDA là `True`, thiết bị Paddle có dạng `Place(gpu:0)`, PyTorch CUDA là `True` và tên GPU NVIDIA được in ra.
-
-### Chạy ứng dụng bằng GPU
-
-Sau khi cài xong, nhấp đúp `Chay_OCR_GPU.bat`. Ứng dụng dùng môi trường `ocr-gpu` và tự mở trình duyệt tại <http://127.0.0.1:8000>. Giữ `Chay_OCR_Launcher.bat` cùng thư mục với file chạy. Đóng cửa sổ lệnh để dừng server.
-
-Nếu không khởi động được GPU, kiểm tra driver bằng `nvidia-smi`, xác nhận đã cài đúng requirements trong `ocr-gpu`, rồi chạy lại hai lệnh kiểm tra ở trên. Nếu Paddle báo thiếu DLL hoặc CUDA/cuDNN, kích hoạt `ocr-gpu` và cài lại runtime Conda:
-
-```powershell
-conda activate ocr-gpu
-conda install -c conda-forge cuda-version=12.0 cudnn=8.9.1.23 -y
-```
-
-Nếu GPU không khả dụng trên máy đó, dùng môi trường CPU riêng bên dưới, không cài chồng hai bộ requirements.
-
-## Cài đặt CPU
-
-Nếu không có GPU NVIDIA hoặc không muốn cài CUDA, dùng bản CPU trong một môi trường riêng:
+### CPU
 
 ```powershell
 conda create -n ocr-local python=3.10 pip -y
 conda activate ocr-local
+conda install -c conda-forge tesseract -y
 python -m pip install -r requirements.txt
+```
+
+### GPU NVIDIA
+
+```powershell
+conda create -n ocr-gpu python=3.10 pip -y
+conda activate ocr-gpu
+conda install -c conda-forge tesseract -y
+python -m pip install -r requirements-gpu.txt
+```
+
+Không cài chồng hai bộ requirements vào cùng một môi trường. Tesseract cần có ngôn ngữ `vie`; có thể kiểm tra bằng:
+
+```powershell
+tesseract --list-langs
 ```
 
 ## Chạy ứng dụng
 
-Sau khi cài môi trường tương ứng, nhấp đúp một trong hai file:
+Nhấp đúp file tương ứng:
 
-- `Chay_OCR_GPU.bat` — chạy bằng môi trường `ocr-gpu`.
-- `Chay_OCR_CPU.bat` — chạy bằng môi trường `ocr-local` (cũng nhận `ocr-local-cpu` hoặc `.venv`).
+- `Chay_OCR_CPU.bat` — dùng môi trường `ocr-local`.
+- `Chay_OCR_GPU.bat` — dùng môi trường `ocr-gpu`.
 
-Giữ `Chay_OCR_Launcher.bat` cùng thư mục với hai file trên. Cả hai chế độ dùng cổng 8000; dừng server hiện tại trước khi chuyển CPU/GPU.
+Launcher tự mở <http://127.0.0.1:8000>. Đóng cửa sổ server để dừng ứng dụng. Nếu vừa cập nhật mã nguồn, dừng server cũ rồi khởi động lại. Tài liệu API: <http://127.0.0.1:8000/docs>.
 
-Ảnh, cơ sở dữ liệu và mẫu được lưu tại `%LOCALAPPDATA%\OCR-Vietnamese\data`, không lưu trong thư mục project. Lần đầu chạy có thể cần kết nối Internet để tải trọng số mô hình. Tài liệu API có tại <http://127.0.0.1:8000/docs>.
+Có thể chạy thủ công khi môi trường đã được kích hoạt:
+
+```powershell
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+## Dữ liệu và giới hạn
+
+Launcher lưu ảnh tải lên, cơ sở dữ liệu, mẫu huấn luyện và cache model tại `%LOCALAPPDATA%\OCR-Vietnamese\data`. Nếu chạy Uvicorn thủ công, mặc định dữ liệu nằm trong thư mục `data` của project; có thể đặt biến môi trường `OCR_DATA_DIR` để đổi vị trí.
+
+Ảnh/PDF tải lên giới hạn 15 MB; PDF tối đa 25 trang. Thư mục dữ liệu local không thuộc mã nguồn và được Git bỏ qua.
+
+## Kiểm thử
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+## Lưu ý giấy phép
+
+DocLayout-YOLO được công bố theo AGPL-3.0; checkpoint được dùng có thẻ Apache-2.0. Hãy rà soát giấy phép của thư viện, model và dữ liệu trước khi phân phối ứng dụng. Thông tin này không thay thế tư vấn pháp lý.

@@ -23,6 +23,10 @@
     #source-image { display: block; max-width: 100%; max-height: 70vh; object-fit: contain; }
     #image-overlay { position: absolute; pointer-events: none; }
     .selection-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+    .pdf-navigation { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .pdf-navigation[hidden] { display: none; }
+    .pdf-navigation button { padding: 6px 12px; }
+    .pdf-navigation button:disabled { opacity: .6; cursor: default; }
     #region-button.active { background: #a84d00; }
     #adjust-detection-button.active { background: #a84d00; }
     textarea { width: 100%; min-height: 250px; box-sizing: border-box; border: 1px solid #b8c2cc; border-radius: 6px; padding: 10px; line-height: 1.6; }
@@ -40,20 +44,25 @@
   <header><h1>OCR tiếng Việt — chạy trên máy của bạn</h1></header>
   <main>
     <form class="upload" id="upload-form">
-      <label>Ảnh tài liệu<input name="file" type="file" accept="image/*" required></label>
+      <label>Ảnh hoặc PDF tài liệu<input name="file" type="file" accept="image/*,.pdf,application/pdf" required></label>
       <label>Bộ nhận dạng
         <select name="engine">
-          <option value="vietocr">VietOCR — khuyến nghị cho chữ in tiếng Việt</option>
-          <option value="paddle">PaddleOCR — baseline đa ngôn ngữ Latin</option>
+          <option value="ppocrv6" selected>PP-OCRv6 Medium + DocLayout-YOLO — Tesseract nhận dạng</option>
+          <option value="tesseract">DocLayout-YOLO — Tesseract nhận dạng (không dùng PP-OCRv6)</option>
         </select>
       </label>
-      <button id="upload-button" type="submit">Tải ảnh và nhận dạng</button>
-      <span class="muted">PNG, JPEG, WEBP, BMP, TIFF · tối đa 15 MB</span>
+      <button id="upload-button" type="submit">Tải tệp và nhận dạng</button>
+      <span class="muted">Ảnh hoặc PDF · tối đa 15 MB; PDF tối đa 25 trang</span>
     </form>
     <p id="message" role="status"></p>
     <section class="workspace" aria-label="Kết quả nhận dạng">
       <div class="panel">
         <h2>Ảnh gốc</h2>
+        <div id="pdf-navigation" class="pdf-navigation" hidden>
+          <button id="pdf-previous" type="button">Trang trước</button>
+          <span id="pdf-page-label" class="muted"></span>
+          <button id="pdf-next" type="button">Trang sau</button>
+        </div>
         <div class="image-frame">
           <img id="source-image" alt="Ảnh tài liệu gốc">
           <canvas id="image-overlay" aria-hidden="true"></canvas>
@@ -91,25 +100,41 @@
     const overlay = document.querySelector("#image-overlay");
     const overlayContext = overlay.getContext("2d");
     const editedText = document.querySelector("#edited-text");
+    const machineText = document.querySelector("#machine-text");
     const highlightHint = document.querySelector("#highlight-hint");
     const regionButton = document.querySelector("#region-button");
     const adjustDetectionButton = document.querySelector("#adjust-detection-button");
     const regionHint = document.querySelector("#region-hint");
+    const pdfNavigation = document.querySelector("#pdf-navigation");
+    const pdfPrevious = document.querySelector("#pdf-previous");
+    const pdfNext = document.querySelector("#pdf-next");
+    const pdfPageLabel = document.querySelector("#pdf-page-label");
     let regionSelectionMode = false;
     let detectionAdjustmentMode = false;
     let selectedDetectionIndex = null;
     let selectedEditedLineIndex = null;
     let regionDragStart = null;
     let regionDragEnd = null;
+    let currentPdfPages = [];
+
+    function engineLabel(engine) {
+      if (engine === "ppocrv6" || engine === "paddle") {
+        return "PP-OCRv6 Medium + DocLayout-YOLO · Tesseract";
+      }
+      if (engine === "tesseract") {
+        return "DocLayout-YOLO · Tesseract";
+      }
+      return engine;
+    }
 
     function showDocument(record) {
       currentDocument = record;
       sourceImage.onload = drawHighlights;
       sourceImage.src = `${record.image_url}?t=${Date.now()}`;
-      document.querySelector("#machine-text").value = record.original_text;
+      machineText.value = record.original_text;
       editedText.value = record.edited_text;
       document.querySelector("#status").textContent =
-        `${record.engine} · ${record.status === "reviewed" ? "đã chỉnh sửa" : "chưa duyệt"}`;
+        `${engineLabel(record.engine)} · ${record.status === "reviewed" ? "đã chỉnh sửa" : "chưa duyệt"}`;
       saveButton.disabled = false;
       regionButton.disabled = false;
       adjustDetectionButton.disabled = false;
@@ -124,7 +149,26 @@
       overlay.style.pointerEvents = "none";
       overlay.style.cursor = "default";
       regionHint.textContent = "Có thể kéo chọn phần chữ chưa được OCR nhận ra.";
+      const pageIndex = currentPdfPages.findIndex((page) => page.id === record.id);
+      pdfNavigation.hidden = pageIndex < 0 || currentPdfPages.length < 2;
+      if (!pdfNavigation.hidden) {
+        pdfPageLabel.textContent = `${record.pdf_source_name} · trang ${record.pdf_page_number} / ${record.pdf_page_count}`;
+        pdfPrevious.disabled = pageIndex === 0;
+        pdfNext.disabled = pageIndex === currentPdfPages.length - 1;
+      }
       drawHighlights();
+    }
+
+    async function openDocument(record) {
+      if (record.pdf_id) {
+        const response = await fetch(`/api/documents/${record.id}/pages`);
+        const pages = await response.json();
+        if (!response.ok) throw new Error(pages.detail || "Không tải được các trang PDF.");
+        currentPdfPages = pages;
+      } else {
+        currentPdfPages = [];
+      }
+      showDocument(record);
     }
 
     function selectedEditedLineIndexes() {
@@ -336,7 +380,7 @@
         showDocument(result);
         message.textContent = `Đã OCR lại dòng: ${result.adjusted_text}`;
         regionHint.textContent = result.detection_sample_created
-          ? "Đã lưu ảnh và vùng chữ đã xác nhận làm dữ liệu phát hiện PaddleOCR."
+          ? "Đã lưu ảnh và vùng chữ đã xác nhận làm dữ liệu phát hiện."
           : "Vùng ảnh trùng đã có trong kho dữ liệu phát hiện; không tạo bản lặp.";
       } catch (error) {
         message.textContent = error.message;
@@ -359,12 +403,29 @@
       documents.forEach((item) => {
         const button = document.createElement("button");
         button.type = "button";
-        button.textContent = `${new Date(item.created_at).toLocaleString("vi-VN")} · ${item.engine}`;
-        button.addEventListener("click", () => showDocument(item));
+        const pageLabel = item.pdf_page_number
+          ? `${item.pdf_source_name} · trang ${item.pdf_page_number}/${item.pdf_page_count}`
+          : "Ảnh";
+        button.textContent = `${pageLabel} · ${new Date(item.created_at).toLocaleString("vi-VN")} · ${engineLabel(item.engine)}`;
+        button.addEventListener("click", () => {
+          openDocument(item).catch((error) => { message.textContent = error.message; });
+        });
         history.append(button);
       });
-      if (!currentDocument) showDocument(documents[0]);
+      if (!currentDocument) await openDocument(documents[0]);
     }
+
+    pdfPrevious.addEventListener("click", () => {
+      const pageIndex = currentPdfPages.findIndex((page) => page.id === currentDocument?.id);
+      if (pageIndex > 0) showDocument(currentPdfPages[pageIndex - 1]);
+    });
+
+    pdfNext.addEventListener("click", () => {
+      const pageIndex = currentPdfPages.findIndex((page) => page.id === currentDocument?.id);
+      if (pageIndex >= 0 && pageIndex < currentPdfPages.length - 1) {
+        showDocument(currentPdfPages[pageIndex + 1]);
+      }
+    });
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -374,8 +435,10 @@
         const response = await fetch("/api/documents", { method: "POST", body: new FormData(form) });
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || "Nhận dạng thất bại.");
-        showDocument(result);
-        message.textContent = "Đã nhận dạng xong. Hãy kiểm tra và chỉnh sửa văn bản.";
+        await openDocument(result);
+        message.textContent = result.pdf_page_count
+          ? `Đã nhận dạng ${result.pdf_page_count} trang PDF. Hãy dùng nút chuyển trang để kiểm tra và chỉnh sửa.`
+          : "Đã nhận dạng xong. Hãy kiểm tra và chỉnh sửa văn bản.";
         await loadHistory();
       } catch (error) {
         message.textContent = error.message;
@@ -397,7 +460,7 @@
         if (!response.ok) throw new Error(result.detail || "Không lưu được bản sửa.");
         message.textContent = result.message;
         await loadHistory();
-        document.querySelector("#status").textContent = `${currentDocument.engine} · đã chỉnh sửa`;
+        document.querySelector("#status").textContent = `${engineLabel(currentDocument.engine)} · đã chỉnh sửa`;
       } catch (error) {
         message.textContent = error.message;
       } finally {

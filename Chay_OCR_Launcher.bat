@@ -16,7 +16,9 @@ if /i "%~1"=="gpu" (
 set "APP_URL=http://127.0.0.1:8000"
 curl.exe --silent --fail "%APP_URL%/api/health" >nul 2>&1
 if not errorlevel 1 (
-    echo OCR server da chay tren cong 8000. Hay dung server hien tai truoc khi doi CPU/GPU.
+    echo OCR server da chay tren cong 8000.
+    echo Neu vua cap nhat project, hay dong cua so server cu va chay lai file nay de nap thay doi.
+    echo Hay dung server hien tai truoc khi doi CPU/GPU.
     start "" "%APP_URL%"
     pause
     exit /b 0
