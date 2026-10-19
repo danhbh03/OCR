@@ -78,7 +78,15 @@ async def documents() -> list[dict]:
 
 @app.get("/api/training-samples")
 async def training_samples(engine: str | None = None) -> list[dict[str, Any]]:
-    if engine not in {None, "ppocrv6", "paddle", "tesseract", "vietocr"}:
+    if engine not in {
+        None,
+        "ppocrv6",
+        "paddle",
+        "tesseract",
+        "doclayout_tesseract",
+        "doclayout_ppocr_tesseract",
+        "vietocr",
+    }:
         raise HTTPException(
             status_code=422,
             detail=(
@@ -147,12 +155,21 @@ async def detection_sample_image(sample_id: str) -> FileResponse:
 
 @app.post("/api/documents")
 async def create_document(
-    file: UploadFile = File(...), engine: str = Form("ppocrv6")
+    file: UploadFile = File(...), engine: str = Form("doclayout_tesseract")
 ) -> dict:
-    if engine not in {"ppocrv6", "paddle", "tesseract"}:
+    if engine not in {
+        "ppocrv6",
+        "paddle",
+        "tesseract",
+        "doclayout_tesseract",
+        "doclayout_ppocr_tesseract",
+    }:
         raise HTTPException(
             status_code=422,
-            detail="Engine phải là ppocrv6 hoặc tesseract.",
+            detail=(
+                "Engine phải là doclayout_tesseract, tesseract hoặc "
+                "doclayout_ppocr_tesseract."
+            ),
         )
 
     content = await file.read(MAX_UPLOAD_BYTES + 1)

@@ -4,8 +4,8 @@
 
 ## Cách hoạt động
 
-- **PP-OCRv6 Medium** phát hiện dòng chữ; **DocLayout-YOLO** nhận diện bố cục và sắp xếp nội dung.
-- **Tesseract** là bộ duy nhất nhận dạng chữ. Có thể chọn Tesseract + DocLayout-YOLO để đối chiếu, không dùng PP-OCRv6.
+- **Tesseract** là bộ duy nhất nhận dạng chữ. Chế độ mặc định dùng DocLayout-YOLO để phân tích bố cục rồi tự chọn cách xử lý: với trang chủ yếu là các khối văn bản lớn, Tesseract nhận dạng trực tiếp từng khối; với các bố cục còn lại, PP-OCR phát hiện dòng trong các khối DocLayout rồi Tesseract nhận dạng.
+- Có thể chọn riêng từng nhánh: DocLayout + Tesseract nhận dạng trực tiếp, hoặc DocLayout + PP-OCR phát hiện dòng + Tesseract nhận dạng. PP-OCR chỉ phát hiện dòng, không nhận dạng chữ.
 - PDF có lớp văn bản được dùng để thay đoạn OCR khớp nhất, tránh ghép thêm nội dung lân cận; PDF scan được xử lý như ảnh.
 - Không có tự động sửa chính tả. Người dùng tự sửa nội dung trước khi lưu.
 

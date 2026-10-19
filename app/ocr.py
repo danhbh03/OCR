@@ -17,14 +17,20 @@ logger = logging.getLogger(__name__)
 
 
 def recognize(image_path: str, engine: str) -> tuple[str, list[dict[str, Any]]]:
-    if engine not in {"ppocrv6", "paddle", "tesseract"}:
+    if engine not in {
+        "ppocrv6",
+        "paddle",
+        "tesseract",
+        "doclayout_tesseract",
+        "doclayout_ppocr_tesseract",
+    }:
         raise ValueError(f"OCR engine không hợp lệ: {engine}")
 
     with Image.open(image_path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
     aligned_image, image_to_aligned = _align_page(image)
 
-    if engine in {"ppocrv6", "paddle"}:
+    if engine in {"ppocrv6", "paddle", "doclayout_ppocr_tesseract"}:
         tesseract = _get_tesseract()
         layout_regions = []
         try:
@@ -32,9 +38,14 @@ def recognize(image_path: str, engine: str) -> tuple[str, list[dict[str, Any]]]:
             layout_regions = _detect_layout_regions(aligned_image)
         except (OCRUnavailableError, OSError, RuntimeError, ValueError) as error:
             logger.warning(
-                "Không chạy được DocLayout-YOLO; sẽ sắp dòng PaddleOCR theo "
+                "Không chạy được DocLayout-YOLO; sẽ sắp dòng PP-OCR theo "
                 "tọa độ: %s",
                 error,
+            )
+        if engine == "doclayout_ppocr_tesseract":
+            logger.info(
+                "Chế độ riêng: DocLayout sắp xếp khối, PP-OCR phát hiện dòng, "
+                "Tesseract nhận dạng."
             )
         text_regions = _detect_text_regions(aligned_image)
         if text_regions:
@@ -51,6 +62,77 @@ def recognize(image_path: str, engine: str) -> tuple[str, list[dict[str, Any]]]:
         return _join_lines(lines), lines
 
     tesseract = _get_tesseract()
+    if engine == "doclayout_tesseract":
+        try:
+            layout_blocks = _detect_layout_blocks(aligned_image)
+        except (OCRUnavailableError, OSError, RuntimeError, ValueError) as error:
+            logger.warning(
+                "Không chạy được DocLayout-YOLO; chế độ tự chọn sẽ dùng "
+                "PP-OCR trên toàn trang: %s",
+                error,
+            )
+            layout_blocks = []
+
+        ordered_blocks = _order_layout_blocks(layout_blocks)
+        layout_regions = [
+            (x, y, width, height)
+            for x, y, width, height, _ in ordered_blocks
+        ]
+        if layout_blocks and _should_use_ppocr_for_layout_blocks(
+            layout_blocks, aligned_image.size
+        ):
+            logger.info(
+                "Bố cục nhiều cột/nhiều khối: dùng DocLayout sắp xếp, "
+                "PP-OCR phát hiện dòng và Tesseract nhận dạng."
+            )
+            text_regions = _detect_text_regions(aligned_image)
+            if text_regions:
+                lines = _recognize_tesseract_text_regions(
+                    tesseract,
+                    aligned_image,
+                    _order_text_regions(text_regions, layout_regions),
+                )
+                if not lines:
+                    lines = _recognize_tesseract_layout_blocks(
+                        tesseract, aligned_image, ordered_blocks
+                    )
+            else:
+                logger.warning(
+                    "PP-OCR không phát hiện được dòng; chuyển sang Tesseract "
+                    "trực tiếp trên các khối DocLayout."
+                )
+                lines = _recognize_tesseract_layout_blocks(
+                    tesseract, aligned_image, ordered_blocks
+                )
+        elif layout_blocks:
+            logger.info(
+                "Bố cục chủ yếu là các khối văn bản lớn: dùng DocLayout chia "
+                "khối rồi Tesseract đọc trực tiếp."
+            )
+            lines = _recognize_tesseract_layout_blocks(
+                tesseract,
+                aligned_image,
+                ordered_blocks,
+            )
+        else:
+            logger.info(
+                "Không có khối DocLayout; dùng PP-OCR phát hiện dòng trên "
+                "toàn trang."
+            )
+            text_regions = _detect_text_regions(aligned_image)
+            if text_regions:
+                lines = _recognize_tesseract_text_regions(
+                    tesseract,
+                    aligned_image,
+                    _order_text_regions(text_regions, []),
+                )
+                if not lines:
+                    lines = _recognize_tesseract_page(tesseract, aligned_image)
+            else:
+                lines = _recognize_tesseract_page(tesseract, aligned_image)
+        _map_lines_to_original(lines, image_to_aligned, image.size)
+        return _join_lines(lines), lines
+
     regions = _detect_layout_regions(aligned_image)
     if not regions:
         lines = _recognize_tesseract_page(tesseract, aligned_image)
@@ -84,6 +166,15 @@ def recognize(image_path: str, engine: str) -> tuple[str, list[dict[str, Any]]]:
 def _detect_layout_regions(
     image: Image.Image,
 ) -> list[tuple[int, int, int, int]]:
+    return [
+        (x, y, width, height)
+        for x, y, width, height, _ in _detect_layout_blocks(image)
+    ]
+
+
+def _detect_layout_blocks(
+    image: Image.Image,
+) -> list[tuple[int, int, int, int, str]]:
     model, device = _get_layout_detector()
     image_array = cv2.cvtColor(
         np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR
@@ -117,7 +208,7 @@ def _detect_layout_regions(
             coordinates, confidences, class_ids
         )
     ]
-    return _layout_regions_from_detections(detections, image.size)
+    return _layout_blocks_from_detections(detections, image.size)
 
 
 def _detect_text_regions(image: Image.Image) -> list[dict[str, Any]]:
@@ -153,6 +244,18 @@ def _layout_regions_from_detections(
     detections: list[tuple[float, float, float, float, float, str]],
     image_size: tuple[int, int],
 ) -> list[tuple[int, int, int, int]]:
+    return [
+        (x, y, width, height)
+        for x, y, width, height, _ in _layout_blocks_from_detections(
+            detections, image_size
+        )
+    ]
+
+
+def _layout_blocks_from_detections(
+    detections: list[tuple[float, float, float, float, float, str]],
+    image_size: tuple[int, int],
+) -> list[tuple[int, int, int, int, str]]:
     image_width, image_height = image_size
     text_labels = {
         "title",
@@ -195,16 +298,188 @@ def _layout_regions_from_detections(
             for other in regions
         )
     ]
-    boxes = [(x, y, width, height) for x, y, width, height, _ in regions]
-    return sorted(boxes, key=lambda region: (region[1], region[0]))
+    return sorted(regions, key=lambda region: (region[1], region[0]))
+
+
+def _order_layout_regions(
+    regions: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    text_regions = [
+        {
+            "text": "",
+            "box": [
+                [x, y],
+                [x + width, y],
+                [x + width, y + height],
+                [x, y + height],
+            ],
+            "layout_index": index,
+        }
+        for index, (x, y, width, height) in enumerate(regions)
+    ]
+    ordered = _order_text_regions(text_regions, [])
+    return [regions[region["layout_index"]] for region in ordered]
+
+
+def _order_layout_blocks(
+    blocks: list[tuple[int, int, int, int, str]],
+) -> list[tuple[int, int, int, int, str]]:
+    ordered_regions = _order_layout_regions(
+        [(x, y, width, height) for x, y, width, height, _ in blocks]
+    )
+    remaining = list(blocks)
+    ordered = []
+    for region in ordered_regions:
+        index = next(
+            index
+            for index, block in enumerate(remaining)
+            if block[:4] == region
+        )
+        ordered.append(remaining.pop(index))
+    return ordered
+
+
+def _merge_layout_headings(
+    blocks: list[tuple[int, int, int, int, str]],
+) -> list[tuple[int, int, int, int, str]]:
+    merged = list(blocks)
+    consumed: set[int] = set()
+    for heading_index, (
+        heading_x,
+        heading_y,
+        heading_width,
+        heading_height,
+        label,
+    ) in enumerate(merged):
+        if label not in {"title", "section header"} or heading_index in consumed:
+            continue
+
+        heading_bottom = heading_y + heading_height
+        max_gap = max(36, round(heading_height * 1.5))
+        candidates = []
+        for text_index, (
+            text_x,
+            text_y,
+            text_width,
+            text_height,
+            text_label,
+        ) in enumerate(merged):
+            if (
+                text_index == heading_index
+                or text_index in consumed
+                or text_label != "text"
+            ):
+                continue
+            vertical_gap = text_y - heading_bottom
+            left_alignment = abs(text_x - heading_x) <= max(
+                12, round(heading_height * 0.5)
+            )
+            horizontal_overlap = max(
+                0,
+                min(heading_x + heading_width, text_x + text_width)
+                - max(heading_x, text_x),
+            )
+            overlap_ratio = horizontal_overlap / max(
+                1, min(heading_width, text_width)
+            )
+            heading_is_within_text_width = (
+                text_x <= heading_x
+                and text_x + text_width >= heading_x + heading_width
+            )
+            if (
+                0 <= vertical_gap <= max_gap
+                and (left_alignment or heading_is_within_text_width)
+                and overlap_ratio >= 0.8
+            ):
+                candidates.append(
+                    (vertical_gap, text_index, text_width, text_height)
+                )
+        if not candidates:
+            continue
+
+        _, text_index, text_width, text_height = min(candidates)
+        text_x, text_y = merged[text_index][0:2]
+        left = min(heading_x, text_x)
+        top = min(heading_y, text_y)
+        right = max(heading_x + heading_width, text_x + text_width)
+        bottom = max(heading_bottom, text_y + text_height)
+        merged[text_index] = (
+            left,
+            top,
+            right - left,
+            bottom - top,
+            "text",
+        )
+        consumed.add(heading_index)
+
+    return [block for index, block in enumerate(merged) if index not in consumed]
+
+
+def _should_use_ppocr_for_layout_blocks(
+    blocks: list[tuple[int, int, int, int, str]],
+    image_size: tuple[int, int],
+) -> bool:
+    if len(blocks) >= 12:
+        return True
+
+    image_width, _ = image_size
+    minimum_column_gap = max(12, round(image_width * 0.02))
+    for index, (x1, y1, width1, height1, _) in enumerate(blocks):
+        for x2, y2, width2, height2, _ in blocks[index + 1 :]:
+            vertical_overlap = max(
+                0,
+                min(y1 + height1, y2 + height2) - max(y1, y2),
+            )
+            overlap_ratio = vertical_overlap / max(1, min(height1, height2))
+            horizontal_gap = max(
+                x2 - (x1 + width1),
+                x1 - (x2 + width2),
+                0,
+            )
+            if overlap_ratio >= 0.5 and horizontal_gap >= minimum_column_gap:
+                return True
+    return False
+
+
+def _recognize_tesseract_layout_blocks(
+    tesseract: Any,
+    image: Image.Image,
+    blocks: list[tuple[int, int, int, int, str]],
+) -> list[dict[str, Any]]:
+    lines = []
+    for x, y, width, height, _ in _merge_layout_headings(blocks):
+        text_height = max(8.0, min(width, height) * 0.06)
+        crop_box = (
+            max(0, x - round(text_height)),
+            max(0, y - round(text_height)),
+            min(image.width, x + width + round(text_height)),
+            min(image.height, y + height + round(text_height)),
+        )
+        crop = image.crop(crop_box)
+        crop, scale = _preprocess_tesseract_region(crop, text_height)
+        if crop is None:
+            continue
+        page_segmentation_mode = 11 if y < image.height * 0.12 else 6
+        block_lines = _recognize_tesseract_page(
+            tesseract, crop, page_segmentation_mode
+        )
+        for line in block_lines:
+            for point in line["box"]:
+                point[0] = point[0] / scale + crop_box[0]
+                point[1] = point[1] / scale + crop_box[1]
+            lines.append(line)
+    return lines
 
 
 def _order_text_regions(
     text_regions: list[dict[str, Any]],
     regions: list[tuple[int, int, int, int]],
 ) -> list[dict[str, Any]]:
+    column_ordered, found_columns = _order_detected_column_blocks(text_regions)
+    if found_columns:
+        return column_ordered
     if not regions:
-        return _order_reading_rows(text_regions)
+        return _order_reading_columns(text_regions)
 
     grouped_regions: dict[int, list[dict[str, Any]]] = {}
     unassigned = []
@@ -215,11 +490,289 @@ def _order_text_regions(
         else:
             grouped_regions.setdefault(layout_index, []).append(text_region)
 
+    layout_groups = []
+    for layout_index, (x, y, width, height) in enumerate(regions):
+        if layout_index not in grouped_regions:
+            continue
+        layout_groups.append(
+            {
+                "box": [
+                    [x, y],
+                    [x + width, y],
+                    [x + width, y + height],
+                    [x, y + height],
+                ],
+                "layout_index": layout_index,
+            }
+        )
+    layout_groups.extend(unassigned)
+
     ordered = []
-    for layout_index in sorted(grouped_regions):
-        ordered.extend(_order_reading_rows(grouped_regions[layout_index]))
-    ordered.extend(_order_reading_rows(unassigned))
+    for group in _order_reading_columns(
+        layout_groups, allow_single_item_columns=True
+    ):
+        layout_index = group.get("layout_index")
+        if layout_index is None:
+            ordered.append(group)
+        else:
+            ordered.extend(
+                _order_reading_columns(grouped_regions[layout_index])
+            )
     return ordered
+
+
+def _order_detected_column_blocks(
+    text_regions: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    if len(text_regions) < 4:
+        return text_regions, False
+
+    def bounds(region: dict[str, Any]) -> tuple[float, float, float, float]:
+        points = region.get("box", [])
+        if not points:
+            return 0.0, 0.0, 0.0, 0.0
+        return (
+            min(float(point[0]) for point in points),
+            min(float(point[1]) for point in points),
+            max(float(point[0]) for point in points),
+            max(float(point[1]) for point in points),
+        )
+
+    heights = sorted(
+        bottom - top
+        for left, top, right, bottom in map(bounds, text_regions)
+        if bottom > top and right > left
+    )
+    if not heights:
+        return text_regions, False
+    median_height = heights[len(heights) // 2]
+    minimum_gap = max(1.0, median_height * 0.5)
+
+    horizontal_gaps = []
+    for first_index, first_region in enumerate(text_regions):
+        first_left, first_top, first_right, first_bottom = bounds(first_region)
+        first_height = first_bottom - first_top
+        if first_height <= 0:
+            continue
+        for second_index, second_region in enumerate(text_regions):
+            if first_index == second_index:
+                continue
+            second_left, second_top, second_right, second_bottom = bounds(
+                second_region
+            )
+            second_height = second_bottom - second_top
+            if second_height <= 0:
+                continue
+            vertical_overlap = max(
+                0.0,
+                min(first_bottom, second_bottom) - max(first_top, second_top),
+            )
+            overlap_ratio = vertical_overlap / min(first_height, second_height)
+            if overlap_ratio < 0.5:
+                continue
+            if first_right + minimum_gap <= second_left:
+                horizontal_gaps.append(
+                    (
+                        first_index,
+                        second_index,
+                        first_right,
+                        second_left,
+                        (first_top + first_bottom) / 2,
+                    )
+                )
+            elif second_right + minimum_gap <= first_left:
+                horizontal_gaps.append(
+                    (
+                        second_index,
+                        first_index,
+                        second_right,
+                        first_left,
+                        (first_top + first_bottom) / 2,
+                    )
+                )
+
+    if len(horizontal_gaps) < 2:
+        return text_regions, False
+
+    candidates = sorted(
+        (gap_left + gap_right) / 2
+        for _, _, gap_left, gap_right, _ in horizontal_gaps
+    )
+    best_block = None
+    best_support = 1
+    for separator in candidates:
+        matching_gaps = [
+            gap
+            for gap in horizontal_gaps
+            if gap[2] < separator < gap[3]
+        ]
+        matching_gaps.sort(key=lambda gap: gap[4])
+        gap_runs = []
+        for gap in matching_gaps:
+            if (
+                not gap_runs
+                or gap[4] - gap_runs[-1][-1][4] > median_height * 2.5
+            ):
+                gap_runs.append([gap])
+            else:
+                gap_runs[-1].append(gap)
+        for run in gap_runs:
+            row_centers = sorted(gap[4] for gap in run)
+            distinct_rows = []
+            for center in row_centers:
+                if (
+                    not distinct_rows
+                    or center - distinct_rows[-1] >= median_height * 0.5
+                ):
+                    distinct_rows.append(center)
+            support = len(distinct_rows)
+            if support > best_support:
+                best_support = support
+                best_block = (separator, run)
+
+    if best_block is None:
+        return text_regions, False
+    best_separator, run = best_block
+    column_indexes = {
+        index
+        for gap in run
+        for index in gap[:2]
+    }
+    column_top = min(bounds(text_regions[index])[1] for index in column_indexes)
+    column_bottom = max(
+        bounds(text_regions[index])[3] for index in column_indexes
+    )
+    extension_gap = max(2.0, median_height * 0.45)
+    left_indexes = set()
+    right_indexes = set()
+    for index, region in enumerate(text_regions):
+        if index in column_indexes:
+            continue
+        left, top, right, bottom = bounds(region)
+        if right <= best_separator:
+            left_indexes.add(index)
+        elif left >= best_separator:
+            right_indexes.add(index)
+
+    while True:
+        added = False
+        for index in left_indexes | right_indexes:
+            if index in column_indexes:
+                continue
+            _, top, _, bottom = bounds(text_regions[index])
+            vertical_gap = max(column_top - bottom, top - column_bottom, 0.0)
+            if vertical_gap <= extension_gap:
+                column_indexes.add(index)
+                column_top = min(column_top, top)
+                column_bottom = max(column_bottom, bottom)
+                added = True
+        if not added:
+            break
+
+    left_column = sorted(
+        (text_regions[index] for index in column_indexes if bounds(text_regions[index])[2] <= best_separator),
+        key=lambda region: bounds(region)[1],
+    )
+    right_column = sorted(
+        (text_regions[index] for index in column_indexes if bounds(text_regions[index])[0] >= best_separator),
+        key=lambda region: bounds(region)[1],
+    )
+    if not left_column or not right_column:
+        return text_regions, False
+
+    left_text = [
+        str(text_regions[index].get("text", "")).strip()
+        for index in column_indexes
+        if bounds(text_regions[index])[2] <= best_separator
+    ]
+    contact_labels = {"address", "phone", "email", "linkedin"}
+    label_count = sum(
+        text.strip().casefold().rstrip(":：") in contact_labels
+        or text.strip().endswith((":", "："))
+        for text in left_text
+    )
+    label_column = label_count >= max(2, len(left_text) // 2)
+    if label_column:
+        block = _order_reading_rows(left_column + right_column)
+    else:
+        block = left_column + right_column
+
+    remaining = [
+        region
+        for index, region in enumerate(text_regions)
+        if index not in column_indexes
+    ]
+    before = [region for region in remaining if bounds(region)[1] < column_top]
+    after = [region for region in remaining if bounds(region)[1] >= column_top]
+    before_ordered, _ = _order_detected_column_blocks(before)
+    after_ordered, _ = _order_detected_column_blocks(after)
+    return (
+        _order_reading_rows(before_ordered)
+        + block
+        + _order_reading_rows(after_ordered),
+        True,
+    )
+
+
+def _order_reading_columns(
+    text_regions: list[dict[str, Any]],
+    allow_single_item_columns: bool = False,
+) -> list[dict[str, Any]]:
+    def bounds(region: dict[str, Any]) -> tuple[float, float, float, float]:
+        points = region["box"]
+        return (
+            min(float(point[0]) for point in points),
+            min(float(point[1]) for point in points),
+            max(float(point[0]) for point in points),
+            max(float(point[1]) for point in points),
+        )
+
+    if len(text_regions) < 2 or (
+        len(text_regions) < 4 and not allow_single_item_columns
+    ):
+        return _order_reading_rows(text_regions)
+
+    ordered_by_x = sorted(text_regions, key=lambda region: bounds(region)[0])
+    heights = sorted(bottom - top for _, top, _, bottom in map(bounds, text_regions))
+    minimum_gap = max(1.0, heights[len(heights) // 2] * 0.5)
+    best_split = None
+    best_gap = minimum_gap
+
+    for split_index in range(1, len(ordered_by_x)):
+        left_column = ordered_by_x[:split_index]
+        right_column = ordered_by_x[split_index:]
+        left_bounds = [bounds(region) for region in left_column]
+        right_bounds = [bounds(region) for region in right_column]
+        gap = min(item[0] for item in right_bounds) - max(
+            item[2] for item in left_bounds
+        )
+        if gap <= best_gap:
+            continue
+
+        left_top = min(item[1] for item in left_bounds)
+        left_bottom = max(item[3] for item in left_bounds)
+        right_top = min(item[1] for item in right_bounds)
+        right_bottom = max(item[3] for item in right_bounds)
+        vertical_overlap = max(
+            0.0, min(left_bottom, right_bottom) - max(left_top, right_top)
+        )
+        overlap_ratio = vertical_overlap / min(
+            max(1.0, left_bottom - left_top),
+            max(1.0, right_bottom - right_top),
+        )
+        if overlap_ratio < 0.5:
+            continue
+        best_gap = gap
+        best_split = split_index
+
+    if best_split is None:
+        return _order_reading_rows(text_regions)
+
+    return _order_reading_columns(
+        ordered_by_x[:best_split], allow_single_item_columns
+    ) + _order_reading_columns(
+        ordered_by_x[best_split:], allow_single_item_columns
+    )
 
 
 def _order_reading_rows(
@@ -322,7 +875,88 @@ def _recognize_tesseract_text_regions(
             if text_region["confidence"] is not None:
                 line["detection_confidence"] = text_region["confidence"]
             lines.append(line)
-    return lines
+    return _order_contact_label_values(lines)
+
+
+def _order_contact_label_values(
+    lines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    contact_labels = {"address", "phone", "email", "linkedin"}
+
+    def bounds(line: dict[str, Any]) -> tuple[float, float, float, float]:
+        points = line.get("box", [])
+        if not points:
+            return 0.0, 0.0, 0.0, 0.0
+        return (
+            min(float(point[0]) for point in points),
+            min(float(point[1]) for point in points),
+            max(float(point[0]) for point in points),
+            max(float(point[1]) for point in points),
+        )
+
+    label_indices = [
+        index
+        for index, line in enumerate(lines)
+        if str(line.get("text", "")).strip().casefold().rstrip(":：")
+        in contact_labels
+    ]
+    if len(label_indices) < 2:
+        return lines
+
+    pairs = []
+    used_value_indices: set[int] = set()
+    for label_index in sorted(
+        label_indices, key=lambda index: bounds(lines[index])[1]
+    ):
+        _, label_top, label_right, label_bottom = bounds(lines[label_index])
+        label_height = max(1.0, label_bottom - label_top)
+        candidates = []
+        for value_index, value_line in enumerate(lines):
+            if value_index in label_indices or value_index in used_value_indices:
+                continue
+            value_left, value_top, _, value_bottom = bounds(value_line)
+            value_height = max(1.0, value_bottom - value_top)
+            if value_left < label_right - max(8.0, label_height * 0.25):
+                continue
+            vertical_overlap = max(
+                0.0,
+                min(label_bottom, value_bottom) - max(label_top, value_top),
+            )
+            overlap_ratio = vertical_overlap / min(label_height, value_height)
+            center_distance = abs(
+                (label_top + label_bottom) / 2
+                - (value_top + value_bottom) / 2
+            )
+            if overlap_ratio < 0.3 and center_distance > max(
+                label_height, value_height
+            ) * 0.55:
+                continue
+            candidates.append(
+                (center_distance, value_left - label_right, value_index)
+            )
+        if candidates:
+            _, _, value_index = min(candidates)
+            used_value_indices.add(value_index)
+            pairs.append((label_index, value_index))
+
+    if len(pairs) < 2:
+        return lines
+
+    ordered_pairs = sorted(pairs, key=lambda pair: bounds(lines[pair[0]])[1])
+    paired_indices = {index for pair in ordered_pairs for index in pair}
+    insertion_index = min(paired_indices)
+    ordered_contacts = [
+        line
+        for label_index, value_index in ordered_pairs
+        for line in (lines[label_index], lines[value_index])
+    ]
+    reordered = []
+    for index, line in enumerate(lines):
+        if index == insertion_index:
+            reordered.extend(ordered_contacts)
+        if index not in paired_indices:
+            reordered.append(line)
+    return reordered
 
 
 @lru_cache(maxsize=1)

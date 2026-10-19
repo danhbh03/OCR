@@ -47,8 +47,9 @@
       <label>Ảnh hoặc PDF tài liệu<input name="file" type="file" accept="image/*,.pdf,application/pdf" required></label>
       <label>Bộ nhận dạng
         <select name="engine">
-          <option value="ppocrv6" selected>PP-OCRv6 Medium + DocLayout-YOLO — Tesseract nhận dạng</option>
-          <option value="tesseract">DocLayout-YOLO — Tesseract nhận dạng (không dùng PP-OCRv6)</option>
+          <option value="tesseract">Wall of text: DocLayout chia khối + Tesseract trực tiếp</option>
+          <option value="doclayout_ppocr_tesseract">CV/portfolio: DocLayout + PP-OCR phát hiện dòng + Tesseract</option>
+          <option value="doclayout_tesseract" selected>Tự chọn theo bố cục: DocLayout + Tesseract (wall of text) / DocLayout + PP + Tesseract (CV, portfolio)</option>
         </select>
       </label>
       <button id="upload-button" type="submit">Tải tệp và nhận dạng</button>
@@ -119,10 +120,16 @@
 
     function engineLabel(engine) {
       if (engine === "ppocrv6" || engine === "paddle") {
-        return "PP-OCRv6 Medium + DocLayout-YOLO · Tesseract";
+        return "PP-OCRv6 · Tesseract (chế độ cũ)";
       }
       if (engine === "tesseract") {
-        return "DocLayout-YOLO · Tesseract";
+        return "DocLayout · Tesseract trực tiếp";
+      }
+      if (engine === "doclayout_ppocr_tesseract") {
+        return "DocLayout · PP-OCR phát hiện dòng · Tesseract";
+      }
+      if (engine === "doclayout_tesseract") {
+        return "DocLayout tự chọn · Tesseract / PP-OCR + Tesseract";
       }
       return engine;
     }
