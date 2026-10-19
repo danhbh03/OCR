@@ -203,15 +203,8 @@ def _order_text_regions(
     text_regions: list[dict[str, Any]],
     regions: list[tuple[int, int, int, int]],
 ) -> list[dict[str, Any]]:
-    def position(region: dict[str, Any]) -> tuple[float, float]:
-        points = region["box"]
-        return (
-            min(float(point[1]) for point in points),
-            min(float(point[0]) for point in points),
-        )
-
     if not regions:
-        return sorted(text_regions, key=position)
+        return _order_reading_rows(text_regions)
 
     grouped_regions: dict[int, list[dict[str, Any]]] = {}
     unassigned = []
@@ -224,8 +217,46 @@ def _order_text_regions(
 
     ordered = []
     for layout_index in sorted(grouped_regions):
-        ordered.extend(sorted(grouped_regions[layout_index], key=position))
-    ordered.extend(sorted(unassigned, key=position))
+        ordered.extend(_order_reading_rows(grouped_regions[layout_index]))
+    ordered.extend(_order_reading_rows(unassigned))
+    return ordered
+
+
+def _order_reading_rows(
+    text_regions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    def bounds(region: dict[str, Any]) -> tuple[float, float, float, float]:
+        points = region["box"]
+        return (
+            min(float(point[0]) for point in points),
+            min(float(point[1]) for point in points),
+            max(float(point[0]) for point in points),
+            max(float(point[1]) for point in points),
+        )
+
+    rows: list[list[dict[str, Any]]] = []
+    for region in sorted(text_regions, key=lambda item: bounds(item)[1]):
+        left, top, right, bottom = bounds(region)
+        height = max(1.0, bottom - top)
+        matching_row = None
+        best_overlap = 0.0
+        for row in rows:
+            row_bounds = [bounds(item) for item in row]
+            row_top = min(item[1] for item in row_bounds)
+            row_bottom = max(item[3] for item in row_bounds)
+            overlap = max(0.0, min(bottom, row_bottom) - max(top, row_top))
+            overlap_ratio = overlap / min(height, max(1.0, row_bottom - row_top))
+            if overlap_ratio >= 0.5 and overlap_ratio > best_overlap:
+                matching_row = row
+                best_overlap = overlap_ratio
+        if matching_row is None:
+            rows.append([region])
+        else:
+            matching_row.append(region)
+
+    ordered = []
+    for row in rows:
+        ordered.extend(sorted(row, key=lambda item: bounds(item)[0]))
     return ordered
 
 
