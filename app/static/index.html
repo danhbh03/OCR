@@ -44,7 +44,7 @@
   <header><h1>OCR tiếng Việt — chạy trên máy của bạn</h1></header>
   <main>
     <form class="upload" id="upload-form">
-      <label>Ảnh hoặc PDF tài liệu<input name="file" type="file" accept="image/*,.pdf,application/pdf" required></label>
+      <label>Ảnh hoặc PDF tài liệu (có thể chọn nhiều tệp)<input name="file" type="file" accept="image/*,.pdf,application/pdf" multiple required></label>
       <label>Bộ nhận dạng
         <select name="engine">
           <option value="tesseract">Wall of text: DocLayout chia khối + Tesseract trực tiếp</option>
@@ -76,9 +76,9 @@
         </div>
       </div>
       <div class="panel">
-        <h2>Máy nhận dạng</h2>
+        <h2>Máy nhận dạng · ghép dòng theo câu</h2>
         <textarea id="machine-text" readonly placeholder="Kết quả OCR sẽ hiển thị ở đây"></textarea>
-        <h2 style="margin-top:16px">Bản chỉnh sửa của người dùng</h2>
+        <h2 style="margin-top:16px">Bản chỉnh sửa của người dùng · giữ từng dòng OCR</h2>
         <textarea id="edited-text" placeholder="Sửa nội dung để khớp với tài liệu"></textarea>
         <div class="actions">
           <span id="status" class="muted"></span>
@@ -94,6 +94,8 @@
   <script>
     let currentDocument = null;
     const form = document.querySelector("#upload-form");
+    const fileInput = form.querySelector('input[name="file"]');
+    const engineInput = form.querySelector('select[name="engine"]');
     const message = document.querySelector("#message");
     const uploadButton = document.querySelector("#upload-button");
     const saveButton = document.querySelector("#save-button");
@@ -134,11 +136,40 @@
       return engine;
     }
 
+    function formatOcrTextBySentence(text) {
+      const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+      const sentences = [];
+      let current = "";
+
+      const finishSentence = () => {
+        if (!current) return;
+        sentences.push(current);
+        current = "";
+      };
+
+      for (const line of lines) {
+        const isBullet = /^(?:[-*•‣]|\d+[.)])\s/.test(line);
+        const isHeading = line.length <= 100
+          && line === line.toLocaleUpperCase("vi")
+          && line !== line.toLocaleLowerCase("vi");
+        if (isBullet || isHeading || /[:：]$/.test(line)) {
+          finishSentence();
+          sentences.push(line);
+          continue;
+        }
+
+        current = current ? `${current} ${line}` : line;
+        if (/[.!?…！？。]["'”’»)\]}]*$/u.test(line)) finishSentence();
+      }
+      finishSentence();
+      return sentences.join("\n");
+    }
+
     function showDocument(record) {
       currentDocument = record;
       sourceImage.onload = drawHighlights;
       sourceImage.src = `${record.image_url}?t=${Date.now()}`;
-      machineText.value = record.original_text;
+      machineText.value = formatOcrTextBySentence(record.original_text);
       editedText.value = record.edited_text;
       document.querySelector("#status").textContent =
         `${engineLabel(record.engine)} · ${record.status === "reviewed" ? "đã chỉnh sửa" : "chưa duyệt"}`;
@@ -275,7 +306,18 @@
       for (const index of ocrIndexes) {
         const detection = currentDocument.detections[index];
         if (!detection || !detection.box?.length) continue;
-        const points = detection.box.map(([x, y]) => [x * scaleX, y * scaleY]);
+        const box = detection.box;
+        const minX = Math.min(...box.map(([x]) => x));
+        const maxX = Math.max(...box.map(([x]) => x));
+        const minY = Math.min(...box.map(([, y]) => y));
+        const maxY = Math.max(...box.map(([, y]) => y));
+        const padding = Math.max(3, Math.round((maxY - minY) * 0.12));
+        const centerX = (minX + maxX) / 2;
+        const centerY = (minY + maxY) / 2;
+        const points = box.map(([x, y]) => [
+          Math.max(0, Math.min(sourceImage.naturalWidth, x + Math.sign(x - centerX) * padding)) * scaleX,
+          Math.max(0, Math.min(sourceImage.naturalHeight, y + Math.sign(y - centerY) * padding)) * scaleY
+        ]);
         overlayContext.beginPath();
         overlayContext.moveTo(points[0][0], points[0][1]);
         for (const [x, y] of points.slice(1)) overlayContext.lineTo(x, y);
@@ -436,17 +478,43 @@
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      const files = Array.from(fileInput.files || []);
+      if (!files.length) return;
       uploadButton.disabled = true;
-      message.textContent = "Đang nhận dạng…";
+      const completed = [];
+      const failures = [];
       try {
-        const response = await fetch("/api/documents", { method: "POST", body: new FormData(form) });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.detail || "Nhận dạng thất bại.");
-        await openDocument(result);
-        message.textContent = result.pdf_page_count
-          ? `Đã nhận dạng ${result.pdf_page_count} trang PDF. Hãy dùng nút chuyển trang để kiểm tra và chỉnh sửa.`
-          : "Đã nhận dạng xong. Hãy kiểm tra và chỉnh sửa văn bản.";
-        await loadHistory();
+        for (const [index, file] of files.entries()) {
+          message.textContent = `Đang nhận dạng ${index + 1}/${files.length}: ${file.name}…`;
+          const formData = new FormData();
+          formData.append("file", file, file.name);
+          formData.append("engine", engineInput.value);
+          try {
+            const response = await fetch("/api/documents", {
+              method: "POST",
+              body: formData
+            });
+            const result = await response.json();
+            if (!response.ok) {
+              throw new Error(result.detail || "Nhận dạng thất bại.");
+            }
+            completed.push({ file, result });
+          } catch (error) {
+            failures.push(`${file.name}: ${error.message}`);
+          }
+        }
+
+        if (completed.length) {
+          const latest = completed[completed.length - 1].result;
+          await openDocument(latest);
+          await loadHistory();
+        }
+
+        const summary = `Đã xử lý ${files.length} tệp: thành công ${completed.length}, lỗi ${failures.length}.`;
+        message.textContent = failures.length
+          ? `${summary} ${failures.join(" · ")}`
+          : summary;
+        if (!failures.length) fileInput.value = "";
       } catch (error) {
         message.textContent = error.message;
       } finally {

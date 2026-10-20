@@ -1,5 +1,6 @@
 import os
 import hashlib
+import logging
 import math
 import uuid
 from contextlib import asynccontextmanager
@@ -26,12 +27,14 @@ MAX_PDF_RENDERED_PIXELS = 100_000_000
 MAX_PDF_RENDERED_BYTES = 100 * 1024 * 1024
 ALLOWED_FORMATS = {
     "JPEG": ".jpg",
+    "MPO": ".jpg",
     "PNG": ".png",
     "WEBP": ".webp",
     "BMP": ".bmp",
     "TIFF": ".tiff",
 }
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -199,7 +202,20 @@ async def create_document(
 
     extension = ALLOWED_FORMATS.get(image_format or "")
     if extension is None:
-        raise HTTPException(status_code=415, detail="Định dạng ảnh chưa được hỗ trợ.")
+        detected_format = image_format or "không xác định"
+        logger.warning(
+            "Tệp ảnh tải lên có định dạng không hỗ trợ: %s (%d bytes).",
+            detected_format,
+            len(content),
+        )
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Tệp có định dạng thực tế {detected_format}, chưa được hỗ trợ. "
+                "Ứng dụng hỗ trợ JPEG/JPG (bao gồm ảnh MPO), PNG, WEBP, BMP "
+                "và TIFF."
+            ),
+        )
 
     document_id = str(uuid.uuid4())
     image_name = f"{document_id}{extension}"
