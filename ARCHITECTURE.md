@@ -86,7 +86,9 @@ flowchart TD
     Route --> Layout[DocLayout: phát hiện và xếp khối]
     Layout --> Table{Có khối bảng?}
     Table -->|Có| Grid[Dò lưới và cắt ô]
-    Grid --> Rows[Đọc theo hàng, trái sang phải]
+    Grid --> Dense{Lưới dày đặc / ô gộp?}
+    Dense -->|Có| LineOrder[Nhận dạng dòng chữ, sắp theo hàng]
+    Dense -->|Không| Rows[Đọc từng ô theo hàng]
     Rows --> Num[Thử lại cột chủ yếu là số]
     Table -->|Không| Multi{Nhiều cột/bố cục phức tạp?}
     Multi -->|Có| Detect[PP-OCR phát hiện dòng]
@@ -94,6 +96,7 @@ flowchart TD
     Multi -->|Không| RecBlock[Tesseract nhận dạng từng khối]
     Route --> Fallback[Fallback: PP-OCR phát hiện dòng hoặc Tesseract toàn trang]
     Rows --> Map[Quy đổi box về ảnh gốc]
+    LineOrder --> Map
     RecLine --> Map
     RecBlock --> Map
     Fallback --> Map
@@ -114,7 +117,7 @@ Các bước chuẩn hóa trang có thể gồm đọc EXIF, sửa hướng bằ
 
 | Engine API | Hành vi chính |
 |---|---|
-| `doclayout_tesseract` | Lựa chọn mặc định trên giao diện. DocLayout phân loại khối; bảng được xử lý theo ô/hàng, cột chủ yếu là số có thể được OCR lại với whitelist số. Bố cục chữ thường chọn Tesseract theo khối hoặc PP-OCR phát hiện dòng rồi Tesseract nhận dạng, tùy độ phức tạp. |
+| `doclayout_tesseract` | Lựa chọn mặc định trên giao diện. DocLayout phân loại khối; bảng thông thường được xử lý theo ô/hàng, bảng dày đặc dùng dòng chữ đã phát hiện để tránh tách nhầm ô gộp. Cột chủ yếu là số có thể được OCR lại với whitelist số. Bố cục chữ thường chọn Tesseract theo khối hoặc PP-OCR phát hiện dòng rồi Tesseract nhận dạng, tùy độ phức tạp. |
 | `doclayout_ppocr_tesseract` | DocLayout sắp xếp khối; PP-OCR phát hiện dòng và Tesseract nhận dạng. Bảng vẫn được chuyển qua xử lý bảng chuyên biệt. |
 | `tesseract` | Nhánh tương thích dùng DocLayout để lấy vùng và Tesseract nhận dạng trực tiếp trong vùng; khi không có vùng thì dùng toàn trang. |
 | `ppocrv6`, `paddle` | Các tên tương thích/nhánh cũ. PP-OCR dùng cho phát hiện dòng; việc nhận dạng ký tự vẫn do Tesseract thực hiện. |

@@ -4,9 +4,9 @@
 
 ## Cách hoạt động
 
-- Kiến trúc tổng thể, luồng xử lý, API và cấu trúc dữ liệu được mô tả tại [ARCHITECTURE.md](./ARCHITECTURE.md).
+- Kiến trúc tổng thể, luồng xử lý, API và cấu trúc dữ liệu: [bản Word dễ đọc](./ARCHITECTURE.docx) hoặc [bản Markdown](./ARCHITECTURE.md).
 - **Tesseract** là bộ duy nhất nhận dạng chữ. Chế độ mặc định dùng DocLayout-YOLO để phân tích bố cục rồi tự chọn cách xử lý: với trang chủ yếu là các khối văn bản lớn, Tesseract nhận dạng trực tiếp từng khối; với bố cục nhiều cột có khoảng cách cột rõ ràng, PP-OCR phát hiện dòng trong các khối DocLayout rồi Tesseract nhận dạng. Số lượng khung dòng đơn lẻ không tự kích hoạt nhánh nhiều cột; các khung trùng gần như hoàn toàn được loại bỏ.
-- Với khung được DocLayout nhận diện là bảng, ứng dụng ưu tiên dò đường kẻ để cắt từng ô; Tesseract đọc theo thứ tự từng hàng từ trái sang phải. Các cột có phần lớn nội dung là số được nhận dạng lại bằng Tesseract với whitelist chữ số để giảm nhầm lẫn ký tự. Nếu bảng không có lưới rõ, PP-OCR tìm dòng chữ để Tesseract nhận dạng và sắp theo hàng; nếu không phát hiện được dòng thì Tesseract đọc toàn vùng bảng.
+- Với khung được DocLayout nhận diện là bảng, ứng dụng ưu tiên dò đường kẻ để cắt từng ô; Tesseract đọc theo thứ tự từng hàng từ trái sang phải. Bảng dày đặc có nhiều hàng/cột được nhận dạng theo dòng chữ để tránh áp dụng đường phân cột toàn bảng lên các ô gộp. Các cột có phần lớn nội dung là số được nhận dạng lại bằng Tesseract với whitelist chữ số để giảm nhầm lẫn ký tự. Nếu bảng không có lưới rõ, PP-OCR tìm dòng chữ để Tesseract nhận dạng và sắp theo hàng; nếu không phát hiện được dòng thì Tesseract đọc toàn vùng bảng.
 - Có thể chọn riêng từng nhánh: DocLayout + Tesseract nhận dạng trực tiếp, hoặc DocLayout + PP-OCR phát hiện dòng + Tesseract nhận dạng. PP-OCR chỉ phát hiện dòng, không nhận dạng chữ.
 - PDF có lớp văn bản được dùng để thay đoạn OCR khớp nhất, tránh ghép thêm nội dung lân cận; PDF scan được xử lý như ảnh.
 - Ảnh hỗ trợ JPEG/JPG (bao gồm MPO từ một số điện thoại), PNG, WEBP, BMP và TIFF; với MPO, OCR dùng ảnh chính.

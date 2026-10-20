@@ -691,9 +691,25 @@ def _recognize_tesseract_table_block(
                 error,
             )
             text_regions = []
-        table_lines = _recognize_tesseract_table_grid(
-            tesseract, crop, grid, text_regions
-        )
+        if text_regions and _is_complex_table_grid(grid):
+            logger.info(
+                "Bảng có nhiều ô/đường gộp; nhận dạng theo dòng chữ để tránh "
+                "áp dụng nhầm lưới cột cho các ô gộp."
+            )
+            ordered_regions = _order_table_text_regions_by_grid(
+                text_regions, grid
+            )
+            table_lines = _recognize_tesseract_text_regions(
+                tesseract,
+                crop,
+                ordered_regions,
+                order_contact_values=False,
+            )
+            table_lines = _order_table_text_regions_by_grid(table_lines, grid)
+        else:
+            table_lines = _recognize_tesseract_table_grid(
+                tesseract, crop, grid, text_regions
+            )
     else:
         text_regions = _detect_text_regions(crop)
         if text_regions:
@@ -737,6 +753,49 @@ def _recognize_tesseract_table_block(
             point[0] += crop_box[0]
             point[1] += crop_box[1]
     return table_lines
+
+
+def _is_complex_table_grid(
+    grid: tuple[list[int], list[int]],
+) -> bool:
+    column_count = len(grid[0]) - 1
+    row_count = len(grid[1]) - 1
+    return column_count * row_count >= 72
+
+
+def _order_table_text_regions_by_grid(
+    text_regions: list[dict[str, Any]],
+    grid: tuple[list[int], list[int]],
+) -> list[dict[str, Any]]:
+    column_lines, row_lines = grid
+
+    def order_key(region: dict[str, Any]) -> tuple[int, int, float, float]:
+        points = region.get("box", [])
+        if not points:
+            return len(row_lines), len(column_lines), 0.0, 0.0
+        left = min(float(point[0]) for point in points)
+        top = min(float(point[1]) for point in points)
+        right = max(float(point[0]) for point in points)
+        bottom = max(float(point[1]) for point in points)
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        row_index = max(
+            0,
+            min(
+                len(row_lines) - 2,
+                int(np.searchsorted(row_lines, center_y, side="right") - 1),
+            ),
+        )
+        column_index = max(
+            0,
+            min(
+                len(column_lines) - 2,
+                int(np.searchsorted(column_lines, center_x, side="right") - 1),
+            ),
+        )
+        return row_index, column_index, top, left
+
+    return sorted(text_regions, key=order_key)
 
 
 def _find_table_grid(

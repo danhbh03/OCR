@@ -40,6 +40,7 @@ from app.ocr import (
     _numeric_table_region_ids,
     _find_table_grid,
     _order_table_text_regions,
+    _order_table_text_regions_by_grid,
     OCRUnavailableError,
     recognize,
 )
@@ -374,6 +375,24 @@ class OCRLayoutTests(unittest.TestCase):
             ordered, [regions[1], regions[0], regions[3], regions[2]]
         )
 
+    def test_complex_table_order_keeps_multiline_cell_content_together(self) -> None:
+        regions = [
+            {"text": "right", "box": [[70, 12], [95, 12], [95, 20], [70, 20]]},
+            {"text": "topic 2", "box": [[10, 35], [45, 35], [45, 43], [10, 43]]},
+            {"text": "topic bottom", "box": [[10, 22], [40, 22], [40, 30], [10, 30]]},
+            {"text": "topic top", "box": [[10, 10], [42, 10], [42, 18], [10, 18]]},
+        ]
+
+        ordered = _order_table_text_regions_by_grid(
+            regions,
+            ([0, 60, 100], [0, 30, 50]),
+        )
+
+        self.assertEqual(
+            [region["text"] for region in ordered],
+            ["topic top", "topic bottom", "right", "topic 2"],
+        )
+
     def test_table_grid_finds_row_and_column_rules(self) -> None:
         image = np.full((80, 120, 3), 255, dtype=np.uint8)
         cv2.line(image, (0, 30), (119, 30), (0, 0, 0), 1)
@@ -563,6 +582,43 @@ class OCRLayoutTests(unittest.TestCase):
             [[20, 20], [70, 20]],
         )
         self.assertFalse(recognize_regions.call_args.kwargs["order_contact_values"])
+
+    def test_dense_table_uses_text_regions_instead_of_global_cell_grid(self) -> None:
+        image = Image.new("RGB", (300, 200), "white")
+        regions = [
+            {"text": "", "box": [[70, 30], [100, 30], [100, 42], [70, 42]]},
+            {"text": "", "box": [[20, 30], [50, 30], [50, 42], [20, 42]]},
+        ]
+        recognized = [
+            {"text": "left", "box": [[3, 13], [33, 13], [33, 25], [3, 25]]},
+            {"text": "right", "box": [[53, 13], [83, 13], [83, 25], [53, 25]]},
+        ]
+        dense_grid = (
+            list(range(0, 301, 30)),
+            list(range(0, 201, 25)),
+        )
+        with (
+            patch("app.ocr._dewarp_page", side_effect=lambda crop: (crop, None)),
+            patch("app.ocr._find_table_grid", return_value=dense_grid),
+            patch("app.ocr._detect_text_regions", return_value=regions),
+            patch(
+                "app.ocr._recognize_tesseract_text_regions",
+                return_value=recognized,
+            ) as recognize_regions,
+            patch("app.ocr._recognize_tesseract_table_grid") as recognize_grid,
+        ):
+            lines = _recognize_tesseract_table_block(
+                object(), image, (20, 20, 250, 160, "table")
+            )
+
+        self.assertEqual([line["text"] for line in lines], ["left", "right"])
+        self.assertEqual(lines[0]["box"][0], [20, 30])
+        self.assertEqual(lines[1]["box"][0], [70, 30])
+        self.assertEqual(
+            [region["box"][0] for region in recognize_regions.call_args.args[2]],
+            [[20, 30], [70, 30]],
+        )
+        recognize_grid.assert_not_called()
 
     def test_auto_ocr_routes_detected_table_blocks_to_table_recognizer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
