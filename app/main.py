@@ -16,7 +16,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app import database
 from app.corrections import extract_corrected_samples
-from app.ocr import OCRUnavailableError, recognize
+from app.ocr import OCRUnavailableError, detect_layout_boxes, recognize
 from app.pdf_text import merge_pdf_text
 
 
@@ -375,6 +375,29 @@ async def document_image(document_id: str) -> FileResponse:
     if not image_path.is_file():
         raise HTTPException(status_code=404, detail="Không tìm thấy ảnh gốc.")
     return FileResponse(image_path)
+
+
+@app.get("/api/documents/{document_id}/layout")
+async def document_layout(document_id: str) -> list[dict[str, Any]]:
+    document = database.get_document(document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu.")
+    image_path = database.UPLOAD_DIR / document["image_name"]
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Không tìm thấy ảnh gốc.")
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.copy()
+        return await run_in_threadpool(detect_layout_boxes, image)
+    except OCRUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except (OSError, RuntimeError, ValueError) as error:
+        logger.exception("Không thể phát hiện vùng layout cho tài liệu %s.", document_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Không phát hiện được vùng layout: {error}",
+        ) from error
 
 
 @app.get("/api/documents/{document_id}/pages")

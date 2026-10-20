@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from app import database, main
 from app.ocr import (
@@ -32,22 +33,44 @@ from app.ocr import (
     _should_use_ppocr_for_layout_blocks,
     _preprocess_tesseract_region,
     _get_text_detector,
+    _get_tesseract,
     _recognize_tesseract_text_regions,
     _recognize_tesseract_layout_ppocr_regions,
     _recognize_tesseract_table_block,
     _recognize_tesseract_table_grid,
     _recognize_tesseract_numeric_region,
     _numeric_table_region_ids,
+    _expand_table_block_to_top_rule,
+    _expand_table_block_to_grid,
     _find_table_grid,
+    _find_table_grid_line_segments,
+    _merge_table_grid_cells,
+    _filter_small_overlapping_text_regions,
     _order_table_text_regions,
-    _order_table_text_regions_by_grid,
     OCRUnavailableError,
+    detect_layout_boxes,
     recognize,
 )
 from app.pdf_text import merge_pdf_text
 
 
 class OCRLayoutTests(unittest.TestCase):
+    def test_tesseract_uses_conda_vietnamese_data_when_prefix_is_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tessdata = Path(temp_dir) / "share" / "tessdata"
+            tessdata.mkdir(parents=True)
+            (tessdata / "vie.traineddata").touch()
+
+            with (
+                patch("app.ocr.sys.prefix", temp_dir),
+                patch.dict(os.environ, {"TESSDATA_PREFIX": ""}),
+                patch("pytesseract.get_tesseract_version"),
+                patch("pytesseract.get_languages", return_value=["eng", "vie"]),
+            ):
+                _get_tesseract.__wrapped__()
+
+                self.assertEqual(os.environ["TESSDATA_PREFIX"], str(tessdata))
+
     def test_upload_format_accepts_mpo_photos_with_jpg_extension(self) -> None:
         self.assertEqual(main.ALLOWED_FORMATS["MPO"], ".jpg")
 
@@ -347,6 +370,98 @@ class OCRLayoutTests(unittest.TestCase):
 
         self.assertEqual(regions, [(30, 17, 220, 166)])
 
+    def test_table_block_expands_to_outer_grid_lines(self) -> None:
+        image = Image.new("RGB", (200, 100), "white")
+        grid = ([0, 10, 30, 80, 160, 168], [0, 10, 20, 40, 78, 84])
+
+        with patch("app.ocr._find_table_grid", return_value=grid):
+            expanded = _expand_table_block_to_grid(
+                image, (30, 20, 140, 60, "table")
+            )
+
+        self.assertEqual(expanded, (26, 18, 150, 68, "table"))
+
+    def test_table_grid_line_segments_keep_merged_cell_gaps(self) -> None:
+        image = Image.new("RGB", (100, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((10, 10, 90, 10), fill="black")
+        draw.line((10, 40, 90, 40), fill="black")
+        draw.line((10, 70, 90, 70), fill="black")
+        draw.line((10, 90, 90, 90), fill="black")
+        draw.line((10, 10, 10, 90), fill="black")
+        draw.line((50, 40, 50, 90), fill="black")
+        draw.line((90, 10, 90, 90), fill="black")
+
+        lines = _find_table_grid_line_segments(image)
+        vertical_segments = sorted(
+            (round(line["box"][0][0]), round(line["box"][0][1]), round(line["box"][1][1]))
+            for line in lines
+            if round(line["box"][0][0]) == round(line["box"][1][0])
+        )
+
+        self.assertIn((50, 41, 91), vertical_segments)
+        self.assertNotIn((50, 11, 41), vertical_segments)
+
+    def test_table_block_expands_to_page_edges_when_grid_reaches_edges(self) -> None:
+        image = Image.new("RGB", (1123, 574), "white")
+        grid = ([0, 20, 1000, 1123], [0, 100, 500, 574])
+
+        with patch("app.ocr._find_table_grid", return_value=grid):
+            expanded = _expand_table_block_to_grid(
+                image, (18, 0, 1052, 574, "table")
+            )
+
+        self.assertEqual(expanded, (0, 0, 1123, 574, "table"))
+
+    def test_layout_boxes_map_back_to_original_image_coordinates(self) -> None:
+        image = Image.new("RGB", (200, 100), "white")
+        aligned_image = Image.new("RGB", (200, 100), "white")
+        transform = np.array(
+            [[1, 0, 10], [0, 1, 5], [0, 0, 1]], dtype=np.float32
+        )
+        with (
+            patch(
+                "app.ocr._align_page",
+                return_value=(aligned_image, transform),
+            ) as align_page,
+            patch(
+                "app.ocr._detect_layout_blocks",
+                return_value=[(30, 20, 40, 30, "table")],
+            ),
+            patch(
+                "app.ocr._find_table_grid",
+                return_value=([0, 20, 40], [0, 15, 30]),
+            ),
+            patch(
+                "app.ocr._find_table_grid_line_segments",
+                return_value=[
+                    {"box": [[0.0, 0.0], [40.0, 0.0]]},
+                    {"box": [[20.0, 0.0], [20.0, 30.0]]},
+                ],
+            ),
+        ):
+            boxes = detect_layout_boxes(image)
+
+        self.assertEqual(align_page.call_args.args[0].size, image.size)
+        self.assertEqual(
+            boxes,
+            [
+                {
+                    "label": "table",
+                    "box": [
+                        [20.0, 15.0],
+                        [60.0, 15.0],
+                        [60.0, 45.0],
+                        [20.0, 45.0],
+                    ],
+                    "lines": [
+                        [[20.0, 15.0], [60.0, 15.0]],
+                        [[40.0, 15.0], [40.0, 45.0]],
+                    ],
+                }
+            ],
+        )
+
     def test_table_regions_are_read_row_by_row_then_left_to_right(self) -> None:
         regions = [
             {"text": "", "box": [[100, 10], [145, 10], [145, 20], [100, 20]]},
@@ -375,22 +490,18 @@ class OCRLayoutTests(unittest.TestCase):
             ordered, [regions[1], regions[0], regions[3], regions[2]]
         )
 
-    def test_complex_table_order_keeps_multiline_cell_content_together(self) -> None:
+    def test_complex_table_regions_are_read_row_by_row(self) -> None:
         regions = [
-            {"text": "right", "box": [[70, 12], [95, 12], [95, 20], [70, 20]]},
-            {"text": "topic 2", "box": [[10, 35], [45, 35], [45, 43], [10, 43]]},
-            {"text": "topic bottom", "box": [[10, 22], [40, 22], [40, 30], [10, 30]]},
-            {"text": "topic top", "box": [[10, 10], [42, 10], [42, 18], [10, 18]]},
+            {"text": "left second", "box": [[10, 47], [45, 47], [45, 59], [10, 59]]},
+            {"text": "right first", "box": [[70, 31], [95, 31], [95, 43], [70, 43]]},
+            {"text": "left first", "box": [[10, 30], [45, 30], [45, 42], [10, 42]]},
         ]
 
-        ordered = _order_table_text_regions_by_grid(
-            regions,
-            ([0, 60, 100], [0, 30, 50]),
-        )
+        ordered = _order_table_text_regions(regions)
 
         self.assertEqual(
             [region["text"] for region in ordered],
-            ["topic top", "topic bottom", "right", "topic 2"],
+            ["left first", "right first", "left second"],
         )
 
     def test_table_grid_finds_row_and_column_rules(self) -> None:
@@ -406,10 +517,122 @@ class OCRLayoutTests(unittest.TestCase):
         self.assertEqual(grid[0], [0, 40, 80, 120])
         self.assertEqual(grid[1], [0, 30, 60, 80])
 
+    def test_table_grid_merges_cells_when_shared_rule_is_absent(self) -> None:
+        image = Image.new("RGB", (100, 80), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((10, 10, 90, 10), fill="black")
+        draw.line((10, 40, 90, 40), fill="black")
+        draw.line((10, 70, 90, 70), fill="black")
+        draw.line((10, 10, 10, 70), fill="black")
+        draw.line((50, 40, 50, 70), fill="black")
+        draw.line((90, 10, 90, 70), fill="black")
+        draw.line((50, 14, 50, 36), fill="black")
+
+        cells = _merge_table_grid_cells(
+            image, ([10, 50, 90], [10, 40, 70])
+        )
+
+        self.assertEqual(cells, [(10, 10, 90, 40), (10, 40, 50, 70), (50, 40, 90, 70)])
+
+    def test_table_grid_merges_framed_cells_across_all_rows_and_columns(self) -> None:
+        image = Image.new("RGB", (101, 81), "white")
+        draw = ImageDraw.Draw(image)
+        columns = [0, 25, 50, 75, 100]
+        rows = [0, 20, 40, 60, 80]
+
+        for y in rows:
+            for left, right in zip(columns, columns[1:]):
+                if y == 40 and left == 75:
+                    continue
+                draw.line((left, y, right, y), fill="black")
+        for x in columns:
+            for top, bottom in zip(rows, rows[1:]):
+                if (top == 0 and x in (25, 50, 75)) or (
+                    top == 20 and x == 50
+                ) or (top == 60 and x == 25):
+                    continue
+                draw.line((x, top, x, bottom), fill="black")
+
+        cells = _merge_table_grid_cells(
+            image, (columns, rows)
+        )
+
+        self.assertEqual(
+            cells,
+            [
+                (0, 0, 100, 20),
+                (0, 20, 25, 40),
+                (25, 20, 75, 40),
+                (75, 20, 100, 60),
+                (0, 40, 25, 60),
+                (25, 40, 50, 60),
+                (50, 40, 75, 60),
+                (0, 60, 50, 80),
+                (50, 60, 75, 80),
+                (75, 60, 100, 80),
+            ],
+        )
+
+    def test_table_grid_recognition_uses_merged_cell_crops(self) -> None:
+        image = Image.new("RGB", (100, 80), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((10, 10, 90, 10), fill="black")
+        draw.line((10, 40, 90, 40), fill="black")
+        draw.line((10, 70, 90, 70), fill="black")
+        draw.line((10, 10, 10, 70), fill="black")
+        draw.line((50, 40, 50, 70), fill="black")
+        draw.line((90, 10, 90, 70), fill="black")
+        cell_result = [
+            {"text": "cell", "box": [[0, 0], [7, 0], [7, 7], [0, 7]]}
+        ]
+
+        with patch(
+            "app.ocr._recognize_tesseract_page",
+            return_value=cell_result,
+        ) as recognize_page:
+            lines = _recognize_tesseract_table_grid(
+                object(),
+                image,
+                ([10, 50, 90], [10, 40, 70]),
+            )
+
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(
+            [call.args[1].size for call in recognize_page.call_args_list],
+            [(74, 24), (34, 24), (34, 24)],
+        )
+
+    def test_table_block_expands_up_to_bordered_top_rule(self) -> None:
+        image = Image.new("RGB", (120, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((5, 20, 114, 20), fill="black", width=1)
+        draw.line((5, 40, 114, 40), fill="black", width=1)
+        draw.line((5, 90, 114, 90), fill="black", width=1)
+        draw.line((5, 20, 5, 90), fill="black", width=1)
+        draw.line((114, 20, 114, 90), fill="black", width=1)
+
+        expanded = _expand_table_block_to_top_rule(
+            image, (5, 40, 110, 50, "table")
+        )
+
+        self.assertEqual(expanded, (5, 18, 110, 72, "table"))
+
+    def test_table_block_ignores_unrelated_top_horizontal_rule(self) -> None:
+        image = Image.new("RGB", (120, 100), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((5, 20, 114, 20), fill="black", width=1)
+
+        self.assertEqual(
+            _expand_table_block_to_top_rule(
+                image, (5, 40, 110, 50, "table")
+            ),
+            (5, 40, 110, 50, "table"),
+        )
+
     def test_table_grid_recognition_reads_cells_in_row_major_order(self) -> None:
         image = Image.new("RGB", (120, 80), "white")
         cell_lines = [
-            [{"text": f"cell {index}", "box": [[0, 0], [5, 0], [5, 5], [0, 5]]}]
+            [{"text": f"cell {index}", "box": [[0, 0], [7, 0], [7, 7], [0, 7]]}]
             for index in range(9)
         ]
         with patch(
@@ -437,6 +660,66 @@ class OCRLayoutTests(unittest.TestCase):
             )
         )
 
+    def test_table_grid_can_read_direct_cells_in_column_major_order(self) -> None:
+        image = Image.new("RGB", (120, 80), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 39, 29), fill="red")
+        draw.rectangle((40, 0, 79, 29), fill="green")
+        draw.rectangle((0, 30, 39, 59), fill="blue")
+        draw.rectangle((40, 30, 79, 59), fill="yellow")
+        labels_by_color = {
+            (255, 0, 0): "top-left",
+            (0, 128, 0): "top-right",
+            (0, 0, 255): "bottom-left",
+            (255, 255, 0): "bottom-right",
+        }
+
+        def recognize_cell(_tesseract, cell_image, **_kwargs):
+            label = labels_by_color[cell_image.getpixel((0, 0))]
+            return [
+                {
+                    "text": label,
+                    "box": [[0, 0], [7, 0], [7, 7], [0, 7]],
+                }
+            ]
+
+        with patch(
+            "app.ocr._merge_table_grid_cells",
+            return_value=[
+                (0, 0, 40, 30),
+                (40, 0, 80, 30),
+                (0, 30, 40, 60),
+                (40, 30, 80, 60),
+            ],
+        ), patch(
+            "app.ocr._recognize_tesseract_page",
+            side_effect=recognize_cell,
+        ) as recognize_page:
+            lines = _recognize_tesseract_table_grid(
+                object(),
+                image,
+                ([0, 40, 80], [0, 30, 60]),
+                use_ppocr_regions=False,
+                column_major=True,
+            )
+
+        self.assertEqual(
+            [line["text"] for line in lines],
+            ["top-left", "bottom-left", "top-right", "bottom-right"],
+        )
+        self.assertEqual(
+            [
+                call.args[1].getpixel((0, 0))
+                for call in recognize_page.call_args_list
+            ],
+            [
+                (255, 0, 0),
+                (0, 0, 255),
+                (0, 128, 0),
+                (255, 255, 0),
+            ],
+        )
+
     def test_table_grid_uses_line_detections_per_cell_before_cell_fallback(
         self,
     ) -> None:
@@ -448,11 +731,11 @@ class OCRLayoutTests(unittest.TestCase):
         ]
         line_result = {
             "text": "detected",
-            "box": [[3, 3], [8, 3], [8, 8], [3, 8]],
+            "box": [[3, 3], [10, 3], [10, 10], [3, 10]],
         }
         fallback_result = {
             "text": "fallback",
-            "box": [[0, 0], [5, 0], [5, 5], [0, 5]],
+            "box": [[0, 0], [7, 0], [7, 7], [0, 7]],
         }
         with (
             patch(
@@ -477,6 +760,206 @@ class OCRLayoutTests(unittest.TestCase):
         )
         self.assertEqual(recognize_regions.call_count, 3)
         recognize_cell.assert_called_once()
+
+    def test_table_grid_keeps_regions_overlapping_the_three_pixel_cell_margin(
+        self,
+    ) -> None:
+        image = Image.new("RGB", (100, 30), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((0, 0, 100, 0), fill="black")
+        draw.line((0, 29, 100, 29), fill="black")
+        draw.line((0, 0, 0, 29), fill="black")
+        draw.line((50, 0, 50, 29), fill="black")
+        draw.line((99, 0, 99, 29), fill="black")
+        regions = [
+            {
+                "text": "",
+                "box": [[47, 10], [55, 10], [55, 18], [47, 18]],
+                "confidence": 0.9,
+            }
+        ]
+        line_result = {
+            "text": "edge",
+            "box": [[0, 0], [7, 0], [7, 7], [0, 7]],
+        }
+
+        with (
+            patch(
+                "app.ocr._recognize_tesseract_text_regions",
+                return_value=[line_result],
+            ) as recognize_regions,
+            patch("app.ocr._recognize_tesseract_page", return_value=[]),
+        ):
+            lines = _recognize_tesseract_table_grid(
+                object(),
+                image,
+                ([0, 50, 100], [0, 30]),
+                regions,
+            )
+
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["text"], "edge")
+        region_image, local_regions = recognize_regions.call_args.args[1:3]
+        self.assertEqual(region_image.size, (50, 24))
+        self.assertEqual(min(point[0] for point in local_regions[0]["box"]), 0)
+
+    def test_table_grid_splits_oversized_pp_regions_into_text_lines(self) -> None:
+        image = Image.new("RGB", (100, 60), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 5, 90, 5), fill="black")
+        draw.rectangle((10, 54, 90, 54), fill="black")
+        draw.rectangle((10, 5, 10, 54), fill="black")
+        draw.rectangle((90, 5, 90, 54), fill="black")
+        draw.text((30, 15), "HELLO", font=ImageFont.load_default(), fill="black")
+        draw.text((30, 34), "WORLD", font=ImageFont.load_default(), fill="black")
+        region = {
+            "box": [[25, 12], [65, 12], [65, 48], [25, 48]],
+            "confidence": 0.9,
+        }
+        recognized_line = {
+            "text": "line",
+            "box": [[0, 0], [7, 0], [7, 7], [0, 7]],
+        }
+
+        with (
+            patch(
+                "app.ocr._recognize_tesseract_text_regions",
+                return_value=[recognized_line],
+            ) as recognize_regions,
+            patch("app.ocr._recognize_tesseract_page", return_value=[]),
+        ):
+            lines = _recognize_tesseract_table_grid(
+                object(),
+                image,
+                ([10, 90], [5, 55]),
+                [region],
+            )
+
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(recognize_regions.call_count, 2)
+        detected_bands = [
+            (
+                min(point[1] for point in call.args[2][0]["box"]),
+                max(point[1] for point in call.args[2][0]["box"]),
+            )
+            for call in recognize_regions.call_args_list
+        ]
+        self.assertLess(detected_bands[0][1], detected_bands[1][0])
+
+    def test_table_grid_splits_lines_with_two_pixel_vertical_gap(self) -> None:
+        image = Image.new("RGB", (100, 40), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 0, 90, 0), fill="black")
+        draw.rectangle((10, 39, 90, 39), fill="black")
+        draw.rectangle((10, 0, 10, 39), fill="black")
+        draw.rectangle((90, 0, 90, 39), fill="black")
+        draw.rectangle((32, 10, 40, 13), fill="black")
+        draw.rectangle((32, 16, 40, 19), fill="black")
+        region = {
+            "box": [[25, 8], [55, 8], [55, 22], [25, 22]],
+            "confidence": 0.9,
+        }
+
+        with (
+            patch(
+                "app.ocr._recognize_tesseract_text_regions",
+                return_value=[
+                    {
+                        "text": "line",
+                        "box": [[0, 0], [7, 0], [7, 7], [0, 7]],
+                    }
+                ],
+            ) as recognize_regions,
+            patch("app.ocr._recognize_tesseract_page", return_value=[]),
+        ):
+            lines = _recognize_tesseract_table_grid(
+                object(),
+                image,
+                ([10, 90], [0, 40]),
+                [region],
+            )
+
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(recognize_regions.call_count, 2)
+
+    def test_table_grid_discards_only_regions_tiny_in_both_dimensions(self) -> None:
+        image = Image.new("RGB", (100, 40), "white")
+        regions = [
+            {
+                "box": [[20, 12], [23, 12], [23, 15], [20, 15]],
+                "confidence": 0.9,
+            },
+            {
+                "box": [[24, 12], [30, 12], [30, 18], [24, 18]],
+                "confidence": 0.9,
+            },
+            {
+                "box": [[30, 10], [32, 10], [32, 20], [30, 20]],
+                "confidence": 0.9,
+            },
+            {
+                "box": [[38, 10], [45, 10], [45, 17], [38, 17]],
+                "confidence": 0.9,
+            },
+            {
+                "box": [[60, 12], [72, 12], [72, 14], [60, 14]],
+                "confidence": 0.9,
+            },
+        ]
+
+        with (
+            patch(
+                "app.ocr._recognize_tesseract_text_regions",
+                return_value=[
+                    {
+                        "text": "kept",
+                        "box": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                    }
+                ],
+            ) as recognize_regions,
+            patch(
+                "app.ocr._recognize_tesseract_page",
+                return_value=[
+                    {
+                        "text": "fallback",
+                        "box": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                    }
+                ],
+            ) as recognize_cell,
+        ):
+            _recognize_tesseract_table_grid(
+                object(),
+                image,
+                ([0, 50, 100], [0, 40]),
+                regions,
+            )
+
+        self.assertEqual(recognize_regions.call_count, 3)
+        recognize_cell.assert_not_called()
+
+    def test_table_grid_filters_tiny_tesseract_fallback_result(self) -> None:
+        image = Image.new("RGB", (100, 30), "white")
+        tiny_line = {
+            "text": "noise",
+            "box": [[0, 0], [3, 0], [3, 3], [0, 3]],
+        }
+        narrow_line = {
+            "text": "1",
+            "box": [[0, 0], [3, 0], [3, 10], [0, 10]],
+        }
+
+        with patch(
+            "app.ocr._recognize_tesseract_page",
+            side_effect=[[tiny_line], [narrow_line]],
+        ):
+            lines = _recognize_tesseract_table_grid(
+                object(),
+                image,
+                ([0, 50, 100], [0, 30]),
+            )
+
+        self.assertEqual([line["text"] for line in lines], ["1"])
+        self.assertEqual(lines[0]["box"][0], [53, 3])
 
     def test_numeric_table_detection_uses_repeated_numeric_text_columns(self) -> None:
         numeric_records = [
@@ -583,15 +1066,15 @@ class OCRLayoutTests(unittest.TestCase):
         )
         self.assertFalse(recognize_regions.call_args.kwargs["order_contact_values"])
 
-    def test_dense_table_uses_text_regions_instead_of_global_cell_grid(self) -> None:
+    def test_dense_table_reads_each_cell_without_pp_region_crops(self) -> None:
         image = Image.new("RGB", (300, 200), "white")
         regions = [
-            {"text": "", "box": [[70, 30], [100, 30], [100, 42], [70, 42]]},
-            {"text": "", "box": [[20, 30], [50, 30], [50, 42], [20, 42]]},
+            {"box": [[10, 10], [30, 10], [30, 18], [10, 18]], "confidence": 0.9},
+            {"box": [[60, 40], [80, 40], [80, 48], [60, 48]], "confidence": 0.8},
         ]
         recognized = [
-            {"text": "left", "box": [[3, 13], [33, 13], [33, 25], [3, 25]]},
-            {"text": "right", "box": [[53, 13], [83, 13], [83, 25], [53, 25]]},
+            {"text": "first cell line", "box": [[3, 3], [23, 3], [23, 11], [3, 11]]},
+            {"text": "second row line", "box": [[3, 3], [23, 3], [23, 11], [3, 11]]},
         ]
         dense_grid = (
             list(range(0, 301, 30)),
@@ -600,25 +1083,68 @@ class OCRLayoutTests(unittest.TestCase):
         with (
             patch("app.ocr._dewarp_page", side_effect=lambda crop: (crop, None)),
             patch("app.ocr._find_table_grid", return_value=dense_grid),
-            patch("app.ocr._detect_text_regions", return_value=regions),
             patch(
-                "app.ocr._recognize_tesseract_text_regions",
+                "app.ocr._detect_text_regions",
+                side_effect=AssertionError("dense grid should use direct cell OCR"),
+            ) as detect_text_regions,
+            patch(
+                "app.ocr._recognize_tesseract_table_grid",
                 return_value=recognized,
-            ) as recognize_regions,
-            patch("app.ocr._recognize_tesseract_table_grid") as recognize_grid,
+            ) as recognize_grid,
         ):
             lines = _recognize_tesseract_table_block(
                 object(), image, (20, 20, 250, 160, "table")
             )
 
-        self.assertEqual([line["text"] for line in lines], ["left", "right"])
-        self.assertEqual(lines[0]["box"][0], [20, 30])
-        self.assertEqual(lines[1]["box"][0], [70, 30])
+        self.assertEqual(lines, recognized)
+        detect_text_regions.assert_not_called()
+        recognize_grid.assert_called_once()
+        self.assertEqual(recognize_grid.call_args.args[2], dense_grid)
+        self.assertFalse(recognize_grid.call_args.kwargs["use_ppocr_regions"])
+
+    def test_very_sparse_table_reads_each_cell_without_pp_region_crops(self) -> None:
+        image = Image.new("RGB", (300, 200), "white")
+        sparse_grid = ([0, 150, 300], [0, 100, 200])
+        recognized = [{"text": "cell text", "box": [[3, 3], [30, 3], [30, 12], [3, 12]]}]
+        with (
+            patch("app.ocr._dewarp_page", side_effect=lambda crop: (crop, None)),
+            patch("app.ocr._find_table_grid", return_value=sparse_grid),
+            patch(
+                "app.ocr._detect_text_regions",
+                side_effect=AssertionError("sparse grid should use direct cell OCR"),
+            ) as detect_text_regions,
+            patch(
+                "app.ocr._recognize_tesseract_table_grid",
+                return_value=recognized,
+            ) as recognize_grid,
+        ):
+            lines = _recognize_tesseract_table_block(
+                object(), image, (20, 20, 250, 160, "table")
+            )
+
+        self.assertEqual(lines, recognized)
+        detect_text_regions.assert_not_called()
+        recognize_grid.assert_called_once()
+        self.assertEqual(recognize_grid.call_args.args[2], sparse_grid)
+        self.assertFalse(recognize_grid.call_args.kwargs["use_ppocr_regions"])
+        self.assertTrue(recognize_grid.call_args.kwargs["column_major"])
+
+    def test_small_pp_regions_overlapped_by_thirty_percent_are_removed(self) -> None:
+        regions = [
+            {"box": [[0, 0], [20, 0], [20, 20], [0, 20]], "id": "large"},
+            {"box": [[0, 0], [10, 0], [10, 10], [0, 10]], "id": "covered"},
+            {"box": [[34, 0], [54, 0], [54, 10], [34, 10]], "id": "wide"},
+            {"box": [[27, 0], [37, 0], [37, 10], [27, 10]], "id": "at_threshold"},
+            {"box": [[60, 0], [80, 0], [80, 10], [60, 10]], "id": "large2"},
+            {"box": [[53.1, 0], [62.9, 0], [62.9, 10], [53.1, 10]], "id": "under_threshold"},
+        ]
+
+        kept = _filter_small_overlapping_text_regions(regions)
+
         self.assertEqual(
-            [region["box"][0] for region in recognize_regions.call_args.args[2]],
-            [[20, 30], [70, 30]],
+            [region["id"] for region in kept],
+            ["large", "wide", "large2", "under_threshold"],
         )
-        recognize_grid.assert_not_called()
 
     def test_auto_ocr_routes_detected_table_blocks_to_table_recognizer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1641,6 +2167,33 @@ class OCRLayoutTests(unittest.TestCase):
 
                 self.assertTrue((upload_dir / result["image_name"]).is_file())
                 self.assertEqual(result["original_text"], "page text")
+
+    def test_document_layout_endpoint_returns_layout_boxes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            upload_dir = Path(temp_dir)
+            Image.new("RGB", (40, 30), "white").save(upload_dir / "doc.png")
+            expected_boxes = [
+                {
+                    "label": "table",
+                    "box": [[1, 2], [20, 2], [20, 15], [1, 15]],
+                }
+            ]
+            with (
+                patch.object(database, "UPLOAD_DIR", upload_dir),
+                patch.object(
+                    database,
+                    "get_document",
+                    return_value={"image_name": "doc.png"},
+                ),
+                patch.object(
+                    main,
+                    "run_in_threadpool",
+                    new=AsyncMock(return_value=expected_boxes),
+                ),
+            ):
+                result = asyncio.run(main.document_layout("document-id"))
+
+        self.assertEqual(result, expected_boxes)
 
 
 if __name__ == "__main__":

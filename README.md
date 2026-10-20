@@ -6,13 +6,15 @@
 
 - Kiến trúc tổng thể, luồng xử lý, API và cấu trúc dữ liệu: [bản Word dễ đọc](./ARCHITECTURE.docx) hoặc [bản Markdown](./ARCHITECTURE.md).
 - **Tesseract** là bộ duy nhất nhận dạng chữ. Chế độ mặc định dùng DocLayout-YOLO để phân tích bố cục rồi tự chọn cách xử lý: với trang chủ yếu là các khối văn bản lớn, Tesseract nhận dạng trực tiếp từng khối; với bố cục nhiều cột có khoảng cách cột rõ ràng, PP-OCR phát hiện dòng trong các khối DocLayout rồi Tesseract nhận dạng. Số lượng khung dòng đơn lẻ không tự kích hoạt nhánh nhiều cột; các khung trùng gần như hoàn toàn được loại bỏ.
-- Với khung được DocLayout nhận diện là bảng, ứng dụng ưu tiên dò đường kẻ để cắt từng ô; Tesseract đọc theo thứ tự từng hàng từ trái sang phải. Bảng dày đặc có nhiều hàng/cột được nhận dạng theo dòng chữ để tránh áp dụng đường phân cột toàn bảng lên các ô gộp. Các cột có phần lớn nội dung là số được nhận dạng lại bằng Tesseract với whitelist chữ số để giảm nhầm lẫn ký tự. Nếu bảng không có lưới rõ, PP-OCR tìm dòng chữ để Tesseract nhận dạng và sắp theo hàng; nếu không phát hiện được dòng thì Tesseract đọc toàn vùng bảng.
+- Với khung được DocLayout nhận diện là bảng, OpenCV dò các đoạn đường kẻ và chia vùng thành các ô. Khi thiếu đường phân cách chung, các ô liền kề được gộp lại để giữ nguyên ô gộp như tiêu đề “Mức độ đánh giá”. Lưới rất thưa (không quá 4 ô) hoặc dày (từ 72 ô) đọc trực tiếp từng crop ô bằng Tesseract để tránh PP-OCR chia box chữ thành mảnh và làm méo nội dung; với lưới rất thưa, các ô được đọc theo cột từ trái sang phải, trong mỗi cột từ trên xuống. Các lưới khác có thể dùng PP-OCR phát hiện dòng rồi gán vào ô. Ở nhánh PP, box nhỏ bị box lớn khác chồng ít nhất 30% diện tích box nhỏ sẽ bị loại như detection trùng. Các cột chủ yếu là số có thể được nhận dạng lại bằng whitelist chữ số.
 - Có thể chọn riêng từng nhánh: DocLayout + Tesseract nhận dạng trực tiếp, hoặc DocLayout + PP-OCR phát hiện dòng + Tesseract nhận dạng. PP-OCR chỉ phát hiện dòng, không nhận dạng chữ.
 - PDF có lớp văn bản được dùng để thay đoạn OCR khớp nhất, tránh ghép thêm nội dung lân cận; PDF scan được xử lý như ảnh.
 - Ảnh hỗ trợ JPEG/JPG (bao gồm MPO từ một số điện thoại), PNG, WEBP, BMP và TIFF; với MPO, OCR dùng ảnh chính.
 - Không có tự động sửa chính tả. Người dùng tự sửa nội dung trước khi lưu.
 - Ô kết quả máy ghép các dòng ảnh thành câu và chỉ xuống dòng sau dấu kết câu; tiêu đề, danh sách, và dòng kết thúc bằng dấu hai chấm được giữ riêng. Ô chỉnh sửa vẫn giữ từng dòng OCR để việc đối chiếu với khung ảnh và lưu mẫu huấn luyện chính xác.
-nde
+- Khi box bảng của DocLayout cắt mép lưới, ứng dụng mở rộng đến các đường biên hàng/cột lân cận; nếu bảng chạm mép ảnh thì dùng mép ảnh làm biên. Mép trên thiếu chỉ được khôi phục khi có đường ngang dài cùng hai cạnh dọc xác nhận.
+- Trên giao diện, nhấn **Xem vùng layout** để chạy DocLayout và phủ khung bố cục lên ảnh gốc. Với bảng, giao diện vẽ trực tiếp từng đoạn đường kẻ ngang/dọc OpenCV phát hiện được thay vì tự kéo dài thành ô chữ nhật; nhờ vậy các đường biên bị ngắt ở ô gộp vẫn được thể hiện đúng. Nhấn lại để ẩn; kết quả được giữ lại khi chuyển đổi bật/tắt trên cùng tài liệu.
+
 ## Tiền xử lý ảnh xoay và giấy cong
 
 Trước khi phát hiện bố cục và OCR, ảnh được chuẩn hóa theo thứ tự:

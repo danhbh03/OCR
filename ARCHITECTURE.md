@@ -46,7 +46,7 @@ DocLayout và PP-OCR đảm nhiệm phát hiện/phân chia vùng; Tesseract là
 | `app/pdf_text.py` | Ghép các đoạn văn bản có sẵn trong PDF với các dòng OCR phù hợp mà không làm thay đổi thứ tự OCR không liên quan. |
 | `app/corrections.py` | So sánh văn bản OCR ban đầu với bản người dùng sửa, xác định dòng bị sửa và cắt ảnh tương ứng thành mẫu có nhãn. |
 | `app/database.py` | Khởi tạo SQLite, truy vấn/cập nhật tài liệu, quản lý mẫu huấn luyện/phát hiện và xử lý loại bỏ mẫu trùng. |
-| `app/static/index.html` | Giao diện HTML/CSS/JavaScript: tải ảnh/PDF, xem ảnh và kết quả, điều hướng trang PDF, sửa văn bản, tô sáng box, chọn vùng bỏ sót hoặc điều chỉnh box. |
+| `app/static/index.html` | Giao diện HTML/CSS/JavaScript: tải ảnh/PDF, xem ảnh và kết quả, điều hướng trang PDF, sửa văn bản, tô sáng box, bật/tắt overlay DocLayout và các đoạn đường kẻ bảng OpenCV, chọn vùng bỏ sót hoặc điều chỉnh box. |
 | `tests/test_ocr_layout.py` | Kiểm thử luồng OCR, sắp xếp bố cục/bảng, ánh xạ tọa độ, PDF và các nhánh phát hiện/nhận dạng liên quan. |
 | `requirements.txt` | Bộ phụ thuộc CPU, gồm PaddlePaddle CPU và PaddleOCR. |
 | `requirements-gpu.txt` | Bộ phụ thuộc GPU NVIDIA, dùng PaddlePaddle GPU CUDA 11.8 và PaddleOCR. |
@@ -85,25 +85,29 @@ flowchart TD
     Dewarp --> Route{Chọn engine/bố cục}
     Route --> Layout[DocLayout: phát hiện và xếp khối]
     Layout --> Table{Có khối bảng?}
-    Table -->|Có| Grid[Dò lưới và cắt ô]
-    Grid --> Dense{Lưới dày đặc / ô gộp?}
-    Dense -->|Có| LineOrder[Nhận dạng dòng chữ, sắp theo hàng]
-    Dense -->|Không| Rows[Đọc từng ô theo hàng]
-    Rows --> Num[Thử lại cột chủ yếu là số]
+    Table -->|Có| Expand[Mở rộng khung tới biên lưới khi box bị cắt]
+    Expand --> Grid[OpenCV dò đoạn đường kẻ, gộp vùng không có vạch ngăn thành ô gộp]
+    Grid --> Direct{Lưới rất thưa <=4 ô hoặc dày >=72 ô?}
+    Direct -->|Có| DirectCell[Tesseract đọc trực tiếp từng crop ô; lưới <=4 ô theo cột]
+    Direct -->|Không| PPTable[PP-OCR phát hiện vị trí dòng chữ trong vùng bảng]
+    PPTable --> Dedup[Loại box nhỏ bị box lớn chồng ít nhất 30%]
+    Dedup --> Assign[Gán dòng PP-OCR vào ô tương ứng]
+    Assign --> CellOCR[Tesseract nhận dạng dòng trong crop ô]
+    CellOCR --> Num[Thử lại cột chủ yếu là số]
     Table -->|Không| Multi{Nhiều cột/bố cục phức tạp?}
     Multi -->|Có| Detect[PP-OCR phát hiện dòng]
     Detect --> RecLine[Tesseract nhận dạng từng dòng]
     Multi -->|Không| RecBlock[Tesseract nhận dạng từng khối]
     Route --> Fallback[Fallback: PP-OCR phát hiện dòng hoặc Tesseract toàn trang]
-    Rows --> Map[Quy đổi box về ảnh gốc]
-    LineOrder --> Map
+    DirectCell --> Map[Quy đổi box về ảnh gốc]
+    CellOCR --> Map
     RecLine --> Map
     RecBlock --> Map
     Fallback --> Map
     Map --> Result[Văn bản + detections]
 ```
 
-Các bước chuẩn hóa trang có thể gồm đọc EXIF, sửa hướng bằng Tesseract OSD, hiệu chỉnh phối cảnh khi tìm được biên trang, deskew và dewarp hình học khi có đủ tín hiệu. Luồng cụ thể phụ thuộc engine và kết quả phát hiện; các phép biến đổi ảnh được ánh xạ ngược để box trả về bám trên ảnh gốc.
+Các bước chuẩn hóa trang có thể gồm đọc EXIF, sửa hướng bằng Tesseract OSD, hiệu chỉnh phối cảnh khi tìm được biên trang, deskew và dewarp hình học khi có đủ tín hiệu. Nếu box DocLayout cắt đường lưới bảng, crop được mở rộng theo các đường biên hàng/cột dài gần nhất; khi bảng chạm cạnh ảnh, cạnh ảnh được dùng làm biên. Mép trên thiếu được khôi phục chỉ khi phát hiện được đường ngang dài cùng hai cạnh dọc xác nhận. Luồng cụ thể phụ thuộc engine và kết quả phát hiện; các phép biến đổi ảnh được ánh xạ ngược để box trả về bám trên ảnh gốc.
 
 ### 4.5 Sửa kết quả và thu thập mẫu
 
@@ -117,7 +121,7 @@ Các bước chuẩn hóa trang có thể gồm đọc EXIF, sửa hướng bằ
 
 | Engine API | Hành vi chính |
 |---|---|
-| `doclayout_tesseract` | Lựa chọn mặc định trên giao diện. DocLayout phân loại khối; bảng thông thường được xử lý theo ô/hàng, bảng dày đặc dùng dòng chữ đã phát hiện để tránh tách nhầm ô gộp. Cột chủ yếu là số có thể được OCR lại với whitelist số. Bố cục chữ thường chọn Tesseract theo khối hoặc PP-OCR phát hiện dòng rồi Tesseract nhận dạng, tùy độ phức tạp. |
+| `doclayout_tesseract` | Lựa chọn mặc định trên giao diện. DocLayout phân loại khối; OpenCV dò biên ô bảng và gộp các ô liền kề không có đường phân cách chung, gồm cả ô gộp. Lưới bảng dày đặc được Tesseract đọc trực tiếp theo từng crop ô để tránh box dòng bị chia vụn; bảng ít dày có thể dùng PP-OCR gán dòng vào ô và bỏ box nhỏ bị box lớn chồng ít nhất 50%. Cột chủ yếu là số có thể được OCR lại với whitelist số. Bố cục chữ thường chọn Tesseract theo khối hoặc PP-OCR phát hiện dòng rồi Tesseract nhận dạng, tùy độ phức tạp. |
 | `doclayout_ppocr_tesseract` | DocLayout sắp xếp khối; PP-OCR phát hiện dòng và Tesseract nhận dạng. Bảng vẫn được chuyển qua xử lý bảng chuyên biệt. |
 | `tesseract` | Nhánh tương thích dùng DocLayout để lấy vùng và Tesseract nhận dạng trực tiếp trong vùng; khi không có vùng thì dùng toàn trang. |
 | `ppocrv6`, `paddle` | Các tên tương thích/nhánh cũ. PP-OCR dùng cho phát hiện dòng; việc nhận dạng ký tự vẫn do Tesseract thực hiện. |
@@ -133,6 +137,7 @@ Các lựa chọn giao diện được giới hạn ở ba cấu hình phục v�
 | `GET` | `/api/documents` | Liệt kê lịch sử tài liệu. |
 | `POST` | `/api/documents` | Tải ảnh/PDF và chạy OCR. |
 | `GET` | `/api/documents/{id}/image` | Lấy ảnh trang gốc. |
+| `GET` | `/api/documents/{id}/layout` | Chạy DocLayout và trả các khung bố cục cùng các đoạn đường kẻ bảng OpenCV theo tọa độ ảnh gốc để giao diện phủ lên ảnh. |
 | `GET` | `/api/documents/{id}/pages` | Lấy các trang cùng PDF. |
 | `POST` | `/api/documents/{id}/regions` | OCR vùng được chọn và chèn nội dung bỏ sót. |
 | `POST` | `/api/documents/{id}/detections/adjust` | OCR lại một vùng dòng, cập nhật box và thu thập mẫu phát hiện. |

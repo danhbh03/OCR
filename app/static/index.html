@@ -29,6 +29,7 @@
     .pdf-navigation button:disabled { opacity: .6; cursor: default; }
     #region-button.active { background: #a84d00; }
     #adjust-detection-button.active { background: #a84d00; }
+    #layout-button.active { background: #117864; }
     textarea { width: 100%; min-height: 250px; box-sizing: border-box; border: 1px solid #b8c2cc; border-radius: 6px; padding: 10px; line-height: 1.6; }
     #machine-text { min-height: 130px; background: #f7f8fa; }
     #edited-text { min-height: 360px; }
@@ -72,7 +73,9 @@
         <div class="selection-tools">
           <button id="region-button" type="button" disabled>Chọn vùng bị bỏ sót</button>
           <button id="adjust-detection-button" type="button" disabled>Điều chỉnh vùng dòng đang chọn</button>
+          <button id="layout-button" type="button" disabled>Xem vùng layout</button>
           <span id="region-hint" class="muted">Có thể kéo chọn phần chữ chưa được OCR nhận ra.</span>
+          <span id="layout-hint" class="muted"></span>
         </div>
       </div>
       <div class="panel">
@@ -108,6 +111,8 @@
     const regionButton = document.querySelector("#region-button");
     const adjustDetectionButton = document.querySelector("#adjust-detection-button");
     const regionHint = document.querySelector("#region-hint");
+    const layoutButton = document.querySelector("#layout-button");
+    const layoutHint = document.querySelector("#layout-hint");
     const pdfNavigation = document.querySelector("#pdf-navigation");
     const pdfPrevious = document.querySelector("#pdf-previous");
     const pdfNext = document.querySelector("#pdf-next");
@@ -119,6 +124,9 @@
     let regionDragStart = null;
     let regionDragEnd = null;
     let currentPdfPages = [];
+    let layoutRegions = [];
+    let layoutDocumentId = null;
+    let showLayoutRegions = false;
 
     function engineLabel(engine) {
       if (engine === "ppocrv6" || engine === "paddle") {
@@ -182,8 +190,15 @@
       selectedEditedLineIndex = null;
       regionDragStart = null;
       regionDragEnd = null;
+      layoutRegions = [];
+      layoutDocumentId = null;
+      showLayoutRegions = false;
       regionButton.classList.remove("active");
       adjustDetectionButton.classList.remove("active");
+      layoutButton.classList.remove("active");
+      layoutButton.textContent = "Xem vùng layout";
+      layoutButton.disabled = false;
+      layoutHint.textContent = "";
       overlay.style.pointerEvents = "none";
       overlay.style.cursor = "default";
       regionHint.textContent = "Có thể kéo chọn phần chữ chưa được OCR nhận ra.";
@@ -303,6 +318,38 @@
       const ocrIndexes = mapEditedLinesToOcr(selected);
       const scaleX = width / sourceImage.naturalWidth;
       const scaleY = height / sourceImage.naturalHeight;
+      if (showLayoutRegions) {
+        for (const region of layoutRegions) {
+          if (!region.box?.length) continue;
+          const points = region.box.map(([x, y]) => [x * scaleX, y * scaleY]);
+          const minY = Math.min(...points.map(([, y]) => y));
+          overlayContext.beginPath();
+          overlayContext.moveTo(points[0][0], points[0][1]);
+          for (const [x, y] of points.slice(1)) overlayContext.lineTo(x, y);
+          overlayContext.closePath();
+          overlayContext.fillStyle = "rgba(22, 160, 133, 0.08)";
+          overlayContext.strokeStyle = "#117864";
+          overlayContext.lineWidth = 2;
+          overlayContext.fill();
+          overlayContext.stroke();
+          overlayContext.font = "12px system-ui, sans-serif";
+          overlayContext.lineWidth = 3;
+          overlayContext.strokeStyle = "white";
+          overlayContext.strokeText(region.label, points[0][0] + 3, Math.max(12, minY + 14));
+          overlayContext.fillStyle = "#117864";
+          overlayContext.fillText(region.label, points[0][0] + 3, Math.max(12, minY + 14));
+          for (const line of region.lines || []) {
+            if (line.length !== 2) continue;
+            const linePoints = line.map(([x, y]) => [x * scaleX, y * scaleY]);
+            overlayContext.beginPath();
+            overlayContext.moveTo(linePoints[0][0], linePoints[0][1]);
+            overlayContext.lineTo(linePoints[1][0], linePoints[1][1]);
+            overlayContext.strokeStyle = "#2878c7";
+            overlayContext.lineWidth = 1.5;
+            overlayContext.stroke();
+          }
+        }
+      }
       for (const index of ocrIndexes) {
         const detection = currentDocument.detections[index];
         if (!detection || !detection.box?.length) continue;
@@ -345,6 +392,47 @@
         ? `Đang tô sáng ${ocrIndexes.length} vùng ảnh tương ứng với dòng đang chọn.`
         : "Không tìm thấy vùng OCR tương ứng cho dòng này.";
     }
+
+    layoutButton.addEventListener("click", async () => {
+      if (!currentDocument) return;
+      if (showLayoutRegions) {
+        showLayoutRegions = false;
+        layoutButton.classList.remove("active");
+        layoutButton.textContent = "Xem vùng layout";
+        layoutHint.textContent = "";
+        drawHighlights();
+        return;
+      }
+
+      const documentId = currentDocument.id;
+      layoutButton.disabled = true;
+      layoutHint.textContent = "Đang chạy DocLayout để lấy các khung…";
+      try {
+        if (layoutDocumentId !== documentId) {
+          const response = await fetch(`/api/documents/${documentId}/layout`);
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.detail || "Không tải được vùng layout.");
+          if (currentDocument?.id !== documentId) return;
+          layoutRegions = result;
+          layoutDocumentId = documentId;
+        }
+        showLayoutRegions = true;
+        layoutButton.classList.add("active");
+        layoutButton.textContent = "Ẩn vùng layout";
+        const lineCount = layoutRegions.reduce(
+          (total, region) => total + (region.lines?.length || 0),
+          0
+        );
+        layoutHint.textContent = layoutRegions.length
+          ? `DocLayout tìm thấy ${layoutRegions.length} khung; đang vẽ ${lineCount} đoạn đường kẻ bảng OpenCV.`
+          : "DocLayout không phát hiện được khung nào trên trang.";
+        drawHighlights();
+      } catch (error) {
+        layoutHint.textContent = error.message;
+      } finally {
+        layoutButton.disabled = !currentDocument;
+      }
+    });
 
     function pointerToImagePoint(event) {
       const rect = overlay.getBoundingClientRect();

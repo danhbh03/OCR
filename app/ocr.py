@@ -1,4 +1,6 @@
 import logging
+import os
+from pathlib import Path
 import re
 import sys
 import unicodedata
@@ -45,6 +47,67 @@ DESKEW_MAX_ANGLE = 80.0
 class PageTransform:
     matrix: np.ndarray
     dewarp_offsets: np.ndarray | None = None
+
+
+def detect_layout_boxes(image: Image.Image) -> list[dict[str, Any]]:
+    normalized_image = ImageOps.exif_transpose(image).convert("RGB")
+    aligned_image, image_to_aligned = _align_page(normalized_image)
+    blocks = _detect_layout_blocks(aligned_image)
+    regions = []
+    mapped_lines = []
+    for x, y, width, height, label in blocks:
+        block = (x, y, width, height, label)
+        if label == "table":
+            block = _expand_table_block_to_grid(aligned_image, block)
+        x, y, width, height, label = block
+        line = {
+            "text": label,
+            "box": [
+                [x, y],
+                [x + width, y],
+                [x + width, y + height],
+                [x, y + height],
+            ],
+        }
+        table_lines = (
+            _detect_table_grid_lines(aligned_image, block)
+            if label == "table"
+            else []
+        )
+        regions.append((line, table_lines))
+        mapped_lines.append(line)
+        mapped_lines.extend(table_lines)
+
+    _map_lines_to_original(mapped_lines, image_to_aligned, normalized_image.size)
+    return [
+        {
+            "label": line["text"],
+            "box": line["box"],
+            **({"lines": [table_line["box"] for table_line in table_lines]} if table_lines else {}),
+        }
+        for line, table_lines in regions
+    ]
+
+
+def _detect_table_grid_lines(
+    image: Image.Image,
+    block: tuple[int, int, int, int, str],
+) -> list[dict[str, Any]]:
+    x, y, width, height, _ = block
+    crop_box = (
+        max(0, x),
+        max(0, y),
+        min(image.width, x + width),
+        min(image.height, y + height),
+    )
+    crop = image.crop(crop_box)
+    lines = _find_table_grid_line_segments(crop)
+    for line in lines:
+        for point in line["box"]:
+            point[0] += crop_box[0]
+            point[1] += crop_box[1]
+    return lines
+
 
 def recognize(image_path: str, engine: str) -> tuple[str, list[dict[str, Any]]]:
     if engine not in {
@@ -669,6 +732,7 @@ def _recognize_tesseract_table_block(
     image: Image.Image,
     block: tuple[int, int, int, int, str],
 ) -> list[dict[str, Any]]:
+    block = _expand_table_block_to_grid(image, block)
     x, y, width, height, _ = block
     padding = max(3, round(min(width, height) * 0.02))
     crop_box = (
@@ -681,7 +745,21 @@ def _recognize_tesseract_table_block(
     crop, dewarp_offsets = _dewarp_page(crop)
     dewarped_size = crop.size
     grid = _find_table_grid(crop)
-    if grid is not None:
+    if grid is not None and _should_use_direct_cell_ocr(grid):
+        cell_count = (len(grid[0]) - 1) * (len(grid[1]) - 1)
+        logger.info(
+            "Bảng có lưới rất thưa hoặc dày (%d ô): OpenCV xác định từng ô; "
+            "Tesseract đọc trực tiếp toàn ô để tránh PP-OCR làm vỡ dòng chữ.",
+            cell_count,
+        )
+        table_lines = _recognize_tesseract_table_grid(
+            tesseract,
+            crop,
+            grid,
+            use_ppocr_regions=False,
+            column_major=cell_count <= 4,
+        )
+    else:
         try:
             text_regions = _detect_text_regions(crop)
         except (OCRUnavailableError, OSError, RuntimeError, ValueError) as error:
@@ -691,28 +769,12 @@ def _recognize_tesseract_table_block(
                 error,
             )
             text_regions = []
-        if text_regions and _is_complex_table_grid(grid):
-            logger.info(
-                "Bảng có nhiều ô/đường gộp; nhận dạng theo dòng chữ để tránh "
-                "áp dụng nhầm lưới cột cho các ô gộp."
-            )
-            ordered_regions = _order_table_text_regions_by_grid(
-                text_regions, grid
-            )
-            table_lines = _recognize_tesseract_text_regions(
-                tesseract,
-                crop,
-                ordered_regions,
-                order_contact_values=False,
-            )
-            table_lines = _order_table_text_regions_by_grid(table_lines, grid)
-        else:
+
+        if grid is not None:
             table_lines = _recognize_tesseract_table_grid(
                 tesseract, crop, grid, text_regions
             )
-    else:
-        text_regions = _detect_text_regions(crop)
-        if text_regions:
+        elif text_regions:
             ordered_regions = _order_table_text_regions(text_regions)
             table_lines = _recognize_tesseract_text_regions(
                 tesseract,
@@ -755,47 +817,149 @@ def _recognize_tesseract_table_block(
     return table_lines
 
 
-def _is_complex_table_grid(
+def _expand_table_block_to_top_rule(
+    image: Image.Image,
+    block: tuple[int, int, int, int, str],
+) -> tuple[int, int, int, int, str]:
+    x, y, width, height, label = block
+    search_distance = min(
+        max(24, round(height * 0.3)),
+        max(24, round(image.height * 0.25)),
+    )
+    search_top = max(0, y - search_distance)
+    left = max(0, x)
+    right = min(image.width, x + width)
+    span_width = right - left
+    if span_width < 12 or search_top >= y:
+        return block
+
+    gray = cv2.cvtColor(
+        np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY
+    )
+    binary = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )[1]
+    horizontal_kernel_width = max(12, round(span_width * 0.6))
+    horizontal = cv2.morphologyEx(
+        binary[search_top:y, left:right],
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (horizontal_kernel_width, 1)
+        ),
+    )
+    coverage = (horizontal > 0).sum(axis=1)
+    candidates = np.flatnonzero(coverage >= span_width * 0.6)
+    edge_margin = max(3, round(span_width * 0.02))
+    support_left = max(0, left - edge_margin)
+    support_right = min(image.width, right + edge_margin)
+
+    for candidate in candidates:
+        top_rule = search_top + int(candidate)
+        gap_height = y - top_rule
+        if gap_height < 12:
+            continue
+        vertical_kernel_height = max(
+            12, min(round(gap_height * 0.5), round(image.height * 0.1))
+        )
+        vertical = cv2.morphologyEx(
+            binary[top_rule:y, support_left:support_right],
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT, (1, vertical_kernel_height)
+            ),
+        )
+        vertical_coverage = (vertical > 0).sum(axis=0)
+        required_coverage = gap_height * 0.55
+        support_width = support_right - support_left
+        support_edge_margin = min(support_width, edge_margin * 2)
+        left_edge_supported = (
+            vertical_coverage[:support_edge_margin].max(initial=0)
+            >= required_coverage
+        )
+        right_edge_supported = (
+            vertical_coverage[-support_edge_margin:].max(initial=0)
+            >= required_coverage
+        )
+        if not (left_edge_supported and right_edge_supported):
+            continue
+
+        expanded_top = max(0, top_rule - 2)
+        return x, expanded_top, width, y + height - expanded_top, label
+
+    return block
+
+
+def _expand_table_block_to_grid(
+    image: Image.Image,
+    block: tuple[int, int, int, int, str],
+) -> tuple[int, int, int, int, str]:
+    x, y, width, height, label = _expand_table_block_to_top_rule(image, block)
+    horizontal_padding = max(12, round(width * 0.1))
+    vertical_padding = max(12, round(height * 0.1))
+    crop_left = max(0, x - horizontal_padding)
+    crop_top = max(0, y - vertical_padding)
+    crop_right = min(image.width, x + width + horizontal_padding)
+    crop_bottom = min(image.height, y + height + vertical_padding)
+    grid = _find_table_grid(image.crop((crop_left, crop_top, crop_right, crop_bottom)))
+    if grid is None:
+        return x, y, width, height, label
+
+    column_lines, row_lines = grid
+    left_candidates = [
+        crop_left + line
+        for line in column_lines[1:-1]
+        if crop_left + line < x
+    ]
+    right_candidates = [
+        crop_left + line
+        for line in column_lines[1:-1]
+        if crop_left + line > x + width
+    ]
+    top_candidates = [
+        crop_top + line
+        for line in row_lines[1:-1]
+        if crop_top + line < y
+    ]
+    bottom_candidates = [
+        crop_top + line
+        for line in row_lines[1:-1]
+        if crop_top + line > y + height
+    ]
+    if crop_left == 0 and x <= horizontal_padding:
+        left_candidates.append(0)
+    if (
+        crop_right == image.width
+        and image.width - (x + width) <= horizontal_padding
+    ):
+        right_candidates.append(image.width)
+    if crop_top == 0 and y <= vertical_padding:
+        top_candidates.append(0)
+    if (
+        crop_bottom == image.height
+        and image.height - (y + height) <= vertical_padding
+    ):
+        bottom_candidates.append(image.height)
+
+    expanded_left = max(left_candidates, default=x)
+    expanded_right = min(right_candidates, default=x + width)
+    expanded_top = max(top_candidates, default=y)
+    expanded_bottom = min(bottom_candidates, default=y + height)
+    return (
+        expanded_left,
+        expanded_top,
+        expanded_right - expanded_left,
+        expanded_bottom - expanded_top,
+        label,
+    )
+
+
+def _should_use_direct_cell_ocr(
     grid: tuple[list[int], list[int]],
 ) -> bool:
     column_count = len(grid[0]) - 1
     row_count = len(grid[1]) - 1
-    return column_count * row_count >= 72
-
-
-def _order_table_text_regions_by_grid(
-    text_regions: list[dict[str, Any]],
-    grid: tuple[list[int], list[int]],
-) -> list[dict[str, Any]]:
-    column_lines, row_lines = grid
-
-    def order_key(region: dict[str, Any]) -> tuple[int, int, float, float]:
-        points = region.get("box", [])
-        if not points:
-            return len(row_lines), len(column_lines), 0.0, 0.0
-        left = min(float(point[0]) for point in points)
-        top = min(float(point[1]) for point in points)
-        right = max(float(point[0]) for point in points)
-        bottom = max(float(point[1]) for point in points)
-        center_x = (left + right) / 2
-        center_y = (top + bottom) / 2
-        row_index = max(
-            0,
-            min(
-                len(row_lines) - 2,
-                int(np.searchsorted(row_lines, center_y, side="right") - 1),
-            ),
-        )
-        column_index = max(
-            0,
-            min(
-                len(column_lines) - 2,
-                int(np.searchsorted(column_lines, center_x, side="right") - 1),
-            ),
-        )
-        return row_index, column_index, top, left
-
-    return sorted(text_regions, key=order_key)
+    cell_count = column_count * row_count
+    return cell_count <= 4 or cell_count >= 72
 
 
 def _find_table_grid(
@@ -850,18 +1014,185 @@ def _find_table_grid(
     return [0, *column_lines, width], [0, *row_lines, height]
 
 
+def _merge_table_grid_cells(
+    image: Image.Image,
+    grid: tuple[list[int], list[int]],
+) -> list[tuple[int, int, int, int]]:
+    column_lines, row_lines = grid
+    column_count = len(column_lines) - 1
+    row_count = len(row_lines) - 1
+    gray = cv2.cvtColor(
+        np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY
+    )
+    binary = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )[1]
+
+    parent = list(range(row_count * column_count))
+
+    def find(index: int) -> int:
+        if parent[index] != index:
+            parent[index] = find(parent[index])
+        return parent[index]
+
+    def join(left: int, right: int) -> None:
+        parent[find(right)] = find(left)
+
+    def line_present(
+        line: int,
+        start: int,
+        end: int,
+        vertical: bool,
+    ) -> bool:
+        if end - start <= 6:
+            return True
+        margin = 2
+        if vertical:
+            band = binary[
+                start + margin : end - margin,
+                max(0, line - 2) : min(binary.shape[1], line + 3),
+            ]
+            coverage = (band > 0).any(axis=1)
+        else:
+            band = binary[
+                max(0, line - 2) : min(binary.shape[0], line + 3),
+                start + margin : end - margin,
+            ]
+            coverage = (band > 0).any(axis=0)
+        if coverage.size == 0 or float(coverage.mean()) < 0.7:
+            return False
+        endpoint_length = min(5, max(2, coverage.size // 8))
+        return bool(
+            coverage[:endpoint_length].mean() >= 0.5
+            and coverage[-endpoint_length:].mean() >= 0.5
+        )
+
+    found_separator = False
+    for row in range(row_count):
+        top, bottom = row_lines[row], row_lines[row + 1]
+        for column in range(1, column_count):
+            line = column_lines[column]
+            if line_present(line, top, bottom, vertical=True):
+                found_separator = True
+            else:
+                join(row * column_count + column - 1, row * column_count + column)
+
+    for row in range(1, row_count):
+        line = row_lines[row]
+        for column in range(column_count):
+            left, right = column_lines[column], column_lines[column + 1]
+            if line_present(line, left, right, vertical=False):
+                found_separator = True
+            else:
+                join((row - 1) * column_count + column, row * column_count + column)
+
+    if not found_separator:
+        return [
+            (left, top, right, bottom)
+            for top, bottom in zip(row_lines, row_lines[1:])
+            for left, right in zip(column_lines, column_lines[1:])
+        ]
+
+    components: dict[int, list[tuple[int, int]]] = {}
+    for row in range(row_count):
+        for column in range(column_count):
+            components.setdefault(find(row * column_count + column), []).append(
+                (row, column)
+            )
+
+    cells = []
+    for members in components.values():
+        rows = [row for row, _ in members]
+        columns = [column for _, column in members]
+        first_row, last_row = min(rows), max(rows)
+        first_column, last_column = min(columns), max(columns)
+        if len(members) != (
+            (last_row - first_row + 1) * (last_column - first_column + 1)
+        ):
+            cells.extend(
+                (
+                    column_lines[column],
+                    row_lines[row],
+                    column_lines[column + 1],
+                    row_lines[row + 1],
+                )
+                for row, column in members
+            )
+            continue
+        cells.append(
+            (
+                column_lines[first_column],
+                row_lines[first_row],
+                column_lines[last_column + 1],
+                row_lines[last_row + 1],
+            )
+        )
+    return sorted(cells, key=lambda cell: (cell[1], cell[0]))
+
+
+def _find_table_grid_line_segments(
+    image: Image.Image,
+) -> list[dict[str, Any]]:
+    gray = cv2.cvtColor(
+        np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY
+    )
+    binary = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )[1]
+
+    height, width = binary.shape
+    horizontal_kernel_size = max(12, round(width / 12))
+    vertical_kernel_size = max(12, round(height / 12))
+    horizontal = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (horizontal_kernel_size, 1)
+        ),
+    )
+    vertical = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, vertical_kernel_size)
+        ),
+    )
+    lines = []
+    for mask, is_horizontal, minimum_length in (
+        (horizontal, True, horizontal_kernel_size),
+        (vertical, False, vertical_kernel_size),
+    ):
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8
+        )
+        for index in range(1, count):
+            left, top, line_width, line_height, _ = stats[index]
+            if is_horizontal and line_width >= minimum_length:
+                center_y = top + (line_height - 1) / 2
+                points = [[float(left), center_y], [float(left + line_width - 1), center_y]]
+            elif not is_horizontal and line_height >= minimum_length:
+                center_x = left + (line_width - 1) / 2
+                points = [[center_x, float(top)], [center_x, float(top + line_height - 1)]]
+            else:
+                continue
+            lines.append({"box": points})
+    return lines
+
+
 def _recognize_tesseract_table_grid(
     tesseract: Any,
     image: Image.Image,
     grid: tuple[list[int], list[int]],
     text_regions: list[dict[str, Any]] | None = None,
+    use_ppocr_regions: bool = True,
+    column_major: bool = False,
 ) -> list[dict[str, Any]]:
-    column_lines, row_lines = grid
-    cell_rows = []
-    region_records = []
-    for top, bottom in zip(row_lines, row_lines[1:]):
-        row_cells = []
-        for left, right in zip(column_lines, column_lines[1:]):
+    cell_boxes = _merge_table_grid_cells(image, grid)
+    if not use_ppocr_regions:
+        if column_major:
+            cell_boxes.sort(key=lambda cell: (cell[0], cell[1]))
+        lines = []
+        for left, top, right, bottom in cell_boxes:
             inset = 3
             cell_box = (
                 min(right, left + inset),
@@ -869,65 +1200,185 @@ def _recognize_tesseract_table_grid(
                 max(left, right - inset),
                 max(top, bottom - inset),
             )
-            cell_regions = []
-            for region in text_regions or []:
-                points = region.get("box", [])
-                if not points:
-                    continue
-                center_x = sum(float(point[0]) for point in points) / len(points)
-                center_y = sum(float(point[1]) for point in points) / len(points)
-                if left <= center_x < right and top <= center_y < bottom:
-                    cell_regions.append(region)
-            if cell_regions:
-                cell_image = image.crop(cell_box)
-                cell_records = []
-                for region in _order_table_text_regions(cell_regions):
-                    local_region = {
-                        **region,
-                        "box": [
-                            [
-                                float(point[0]) - cell_box[0],
-                                float(point[1]) - cell_box[1],
-                            ]
-                            for point in region["box"]
-                        ],
-                    }
-                    recognized_lines = _recognize_tesseract_text_regions(
-                        tesseract,
-                        cell_image,
-                        [local_region],
-                        order_contact_values=False,
-                    )
-                    for line in recognized_lines:
-                        for point in line["box"]:
-                            point[0] += cell_box[0]
-                            point[1] += cell_box[1]
-                    record = {
+            cell_lines = _recognize_tesseract_page(
+                tesseract,
+                image.crop(cell_box),
+                page_segmentation_mode=6,
+            )
+            for line in cell_lines:
+                for point in line["box"]:
+                    point[0] += cell_box[0]
+                    point[1] += cell_box[1]
+            lines.extend(cell_lines)
+        return _filter_tiny_table_ocr_lines(lines)
+
+    edge_tolerance = 3
+    line_regions = [
+        line_region
+        for region in text_regions or []
+        for line_region in _split_table_text_region_lines(image, region)
+    ]
+    split_region_count = len(line_regions)
+    line_regions = _filter_small_overlapping_text_regions(line_regions)
+    overlap_regions_dropped = split_region_count - len(line_regions)
+    tiny_regions_dropped = 0
+    unassigned_regions = 0
+    regions_by_cell: list[list[dict[str, Any]]] = [
+        [] for _ in cell_boxes
+    ]
+    for region in line_regions:
+        points = region.get("box", [])
+        if not points:
+            continue
+        region_left = min(float(point[0]) for point in points)
+        region_top = min(float(point[1]) for point in points)
+        region_right = max(float(point[0]) for point in points)
+        region_bottom = max(float(point[1]) for point in points)
+        if (
+            region_right - region_left <= 6
+            and region_bottom - region_top <= 6
+        ):
+            tiny_regions_dropped += 1
+            continue
+        center_x = (region_left + region_right) / 2
+        center_y = (region_top + region_bottom) / 2
+        best_cell_index = None
+        best_overlap = 0.0
+        best_distance = float("inf")
+        for index, (left, top, right, bottom) in enumerate(cell_boxes):
+            overlap_width = max(
+                0.0,
+                min(region_right, right + edge_tolerance)
+                - max(region_left, left - edge_tolerance),
+            )
+            overlap_height = max(
+                0.0,
+                min(region_bottom, bottom + edge_tolerance)
+                - max(region_top, top - edge_tolerance),
+            )
+            overlap = overlap_width * overlap_height
+            if overlap <= 0:
+                continue
+            distance = (center_x - (left + right) / 2) ** 2 + (
+                center_y - (top + bottom) / 2
+            ) ** 2
+            if overlap > best_overlap or (
+                overlap == best_overlap and distance < best_distance
+            ):
+                best_cell_index = index
+                best_overlap = overlap
+                best_distance = distance
+        if best_cell_index is not None:
+            regions_by_cell[best_cell_index].append(region)
+        else:
+            unassigned_regions += 1
+
+    cells = []
+    region_records = []
+    fallback_cells = 0
+    for cell_index, (left, top, right, bottom) in enumerate(cell_boxes):
+        inset = edge_tolerance
+        cell_box = (
+            min(right, left + inset),
+            min(bottom, top + inset),
+            max(left, right - inset),
+            max(top, bottom - inset),
+        )
+        cell_regions = regions_by_cell[cell_index]
+        if cell_regions:
+            region_left = min(
+                float(point[0])
+                for region in cell_regions
+                for point in region["box"]
+            )
+            region_top = min(
+                float(point[1])
+                for region in cell_regions
+                for point in region["box"]
+            )
+            region_right = max(
+                float(point[0])
+                for region in cell_regions
+                for point in region["box"]
+            )
+            region_bottom = max(
+                float(point[1])
+                for region in cell_regions
+                for point in region["box"]
+            )
+            cell_box = (
+                max(
+                    0,
+                    min(
+                        left + inset,
+                        max(left - inset, int(np.floor(region_left))),
+                    ),
+                ),
+                max(
+                    0,
+                    min(
+                        top + inset,
+                        max(top - inset, int(np.floor(region_top))),
+                    ),
+                ),
+                min(
+                    image.width,
+                    max(
+                        right - inset,
+                        min(right + inset, int(np.ceil(region_right))),
+                    ),
+                ),
+                min(
+                    image.height,
+                    max(
+                        bottom - inset,
+                        min(bottom + inset, int(np.ceil(region_bottom))),
+                    ),
+                ),
+            )
+            cell_image = image.crop(cell_box)
+            cell_lines = []
+            for region in _order_table_text_regions(cell_regions):
+                local_region = {
+                    **region,
+                    "box": [
+                        [
+                            float(point[0]) - cell_box[0],
+                            float(point[1]) - cell_box[1],
+                        ]
+                        for point in region["box"]
+                    ],
+                }
+                recognized_lines = _recognize_tesseract_text_regions(
+                    tesseract,
+                    cell_image,
+                    [local_region],
+                    order_contact_values=False,
+                )
+                for line in recognized_lines:
+                    for point in line["box"]:
+                        point[0] += cell_box[0]
+                        point[1] += cell_box[1]
+                region_records.append(
+                    {
                         "region": region,
                         "local_region": local_region,
                         "cell_box": cell_box,
                         "lines": recognized_lines,
                     }
-                    cell_records.append(record)
-                    region_records.append(record)
-                cell_lines = [
-                    line
-                    for record in cell_records
-                    for line in record["lines"]
-                ]
-            else:
-                cell = image.crop(cell_box)
-                cell_lines = _recognize_tesseract_page(
-                    tesseract, cell, page_segmentation_mode=6
                 )
-                for line in cell_lines:
-                    for point in line["box"]:
-                        point[0] += cell_box[0]
-                        point[1] += cell_box[1]
-            row_cells.append(
-                {"box": cell_box, "lines": cell_lines}
+                cell_lines.extend(recognized_lines)
+        else:
+            fallback_cells += 1
+            cell = image.crop(cell_box)
+            cell_lines = _recognize_tesseract_page(
+                tesseract, cell, page_segmentation_mode=6
             )
-        cell_rows.append(row_cells)
+            for line in cell_lines:
+                for point in line["box"]:
+                    point[0] += cell_box[0]
+                    point[1] += cell_box[1]
+        cells.append({"box": cell_box, "lines": cell_lines})
 
     numeric_region_ids = _numeric_table_region_ids(region_records)
     for record in region_records:
@@ -946,24 +1397,189 @@ def _recognize_tesseract_table_grid(
                 point[0] += left
                 point[1] += top
         record["lines"] = numeric_lines
-
     lines = []
-    for row in cell_rows:
-        for cell in row:
-            cell_regions = [
-                record
-                for record in region_records
-                if record["cell_box"] == cell["box"]
+    lines = []
+    for cell in cells:
+        cell_regions = [
+            record
+            for record in region_records
+            if record["cell_box"] == cell["box"]
+        ]
+        if cell_regions:
+            cell["lines"] = [
+                line
+                for record in cell_regions
+                for line in record["lines"]
             ]
-            if cell_regions:
-                cell["lines"] = [
-                    line
-                    for record in cell_regions
-                    for line in record["lines"]
-                ]
-            lines.extend(cell["lines"])
+        lines.extend(cell["lines"])
 
-    return lines
+    filtered_lines = _filter_tiny_table_ocr_lines(lines)
+    tiny_ocr_lines_dropped = len(lines) - len(filtered_lines)
+    logger.info(
+        "Table OCR stats: cells=%d, pp_regions=%d, split_regions=%d, "
+        "tiny_pp_regions_dropped=%d, overlap_pp_regions_dropped=%d, "
+        "unassigned_pp_regions=%d, "
+        "tesseract_fallback_cells=%d, tiny_ocr_lines_dropped=%d, "
+        "output_lines=%d.",
+        len(cell_boxes),
+        len(text_regions or []),
+        split_region_count,
+        tiny_regions_dropped,
+        overlap_regions_dropped,
+        unassigned_regions,
+        fallback_cells,
+        tiny_ocr_lines_dropped,
+        len(filtered_lines),
+    )
+    return filtered_lines
+
+
+def _filter_small_overlapping_text_regions(
+    regions: list[dict[str, Any]],
+    minimum_covered_ratio: float = 0.3,
+) -> list[dict[str, Any]]:
+    bounds = []
+    for region in regions:
+        points = region.get("box", [])
+        if not points:
+            bounds.append(None)
+            continue
+        left = min(float(point[0]) for point in points)
+        top = min(float(point[1]) for point in points)
+        right = max(float(point[0]) for point in points)
+        bottom = max(float(point[1]) for point in points)
+        area = max(0.0, right - left) * max(0.0, bottom - top)
+        bounds.append((left, top, right, bottom, area))
+
+    dropped = set()
+    for small_index, small in enumerate(bounds):
+        if small is None or small[4] <= 0:
+            continue
+        left, top, right, bottom, area = small
+        for large_index, large in enumerate(bounds):
+            if small_index == large_index or large is None or large[4] <= area:
+                continue
+            overlap_width = max(
+                0.0, min(right, large[2]) - max(left, large[0])
+            )
+            overlap_height = max(
+                0.0, min(bottom, large[3]) - max(top, large[1])
+            )
+            if overlap_width * overlap_height / area >= minimum_covered_ratio:
+                dropped.add(small_index)
+                break
+
+    return [region for index, region in enumerate(regions) if index not in dropped]
+
+
+def _filter_tiny_table_ocr_lines(
+    lines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    filtered_lines = []
+    for line in lines:
+        points = line.get("box", [])
+        if points:
+            line_width = max(float(point[0]) for point in points) - min(
+                float(point[0]) for point in points
+            )
+            line_height = max(float(point[1]) for point in points) - min(
+                float(point[1]) for point in points
+            )
+            if line_width <= 6 and line_height <= 6:
+                continue
+        filtered_lines.append(line)
+    return filtered_lines
+
+
+def _split_table_text_region_lines(
+    image: Image.Image,
+    region: dict[str, Any],
+) -> list[dict[str, Any]]:
+    points = region.get("box", [])
+    if not points:
+        return []
+    left = max(0, int(np.floor(min(float(point[0]) for point in points))))
+    top = max(0, int(np.floor(min(float(point[1]) for point in points))))
+    right = min(
+        image.width, int(np.ceil(max(float(point[0]) for point in points)))
+    )
+    bottom = min(
+        image.height, int(np.ceil(max(float(point[1]) for point in points)))
+    )
+    if right - left < 4 or bottom - top < 6:
+        return [region]
+
+    gray = cv2.cvtColor(
+        np.asarray(image.crop((left, top, right, bottom)).convert("RGB")),
+        cv2.COLOR_RGB2GRAY,
+    )
+    binary = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )[1]
+    crop_width = binary.shape[1]
+    horizontal_kernel_width = max(8, round(crop_width * 0.7))
+    horizontal_rules = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (horizontal_kernel_width, 1)
+        ),
+    )
+    ink = cv2.subtract(binary, horizontal_rules)
+    projection = (ink > 0).sum(axis=1)
+    if projection.max(initial=0) == 0:
+        return [region]
+    threshold = max(
+        1.0,
+        float(projection.max()) * 0.08,
+        crop_width * 0.01,
+    )
+    active_rows = projection >= threshold
+    row_indexes = np.flatnonzero(active_rows)
+    if not row_indexes.size:
+        return [region]
+
+    bands = []
+    start = previous = int(row_indexes[0])
+    for row in row_indexes[1:]:
+        row = int(row)
+        if row - previous > 2:
+            bands.append((start, previous + 1))
+            start = row
+        previous = row
+    bands.append((start, previous + 1))
+    if len(bands) < 2:
+        return [region]
+
+    line_regions = []
+    for band_top, band_bottom in bands:
+        if int(projection[band_top:band_bottom].sum()) < 2:
+            continue
+        column_projection = (ink[band_top:band_bottom] > 0).sum(axis=0)
+        active_columns = np.flatnonzero(column_projection)
+        if not active_columns.size:
+            continue
+        line_regions.append(
+            {
+                **region,
+                "box": [
+                    [float(left + int(active_columns[0])), float(top + band_top)],
+                    [
+                        float(left + int(active_columns[-1]) + 1),
+                        float(top + band_top),
+                    ],
+                    [
+                        float(left + int(active_columns[-1]) + 1),
+                        float(top + band_bottom),
+                    ],
+                    [
+                        float(left + int(active_columns[0])),
+                        float(top + band_bottom),
+                    ],
+                ],
+            }
+        )
+    return line_regions if len(line_regions) >= 2 else [region]
 
 
 def _numeric_table_region_ids(
@@ -1144,6 +1760,7 @@ def _recognize_tesseract_layout_ppocr_regions(
     tesseract: Any,
     image: Image.Image,
     regions: list[tuple[int, int, int, int]],
+    order_contact_values: bool = True,
 ) -> list[dict[str, Any]]:
     lines = []
     for x, y, width, height in regions:
@@ -1198,7 +1815,7 @@ def _recognize_tesseract_layout_ppocr_regions(
                 point[0] += crop_box[0]
                 point[1] += crop_box[1]
             lines.append(line)
-    return _order_contact_label_values(lines)
+    return _order_contact_label_values(lines) if order_contact_values else lines
 
 
 def _order_text_regions(
@@ -1815,6 +2432,17 @@ def _get_tesseract() -> Any:
             "Chưa cài pytesseract. Cài requirements.txt hoặc "
             "requirements-gpu.txt rồi khởi động lại."
         ) from error
+
+    conda_tessdata = Path(sys.prefix) / "share" / "tessdata"
+    configured_tessdata = os.environ.get("TESSDATA_PREFIX")
+    if (
+        (conda_tessdata / "vie.traineddata").is_file()
+        and (
+            not configured_tessdata
+            or not (Path(configured_tessdata) / "vie.traineddata").is_file()
+        )
+    ):
+        os.environ["TESSDATA_PREFIX"] = str(conda_tessdata)
 
     try:
         pytesseract.get_tesseract_version()
